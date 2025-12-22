@@ -118,7 +118,7 @@ The `--process` parameter must be the exact executable name of the game you want
 ## Paper and Citation
 
 - Paper: [NitroGen](https://nitrogen.minedojo.org/assets/documents/nitrogen.pdf)
-- Citations:
+- Citation:
 
 ```bibtex
 @misc{nitrogen,
@@ -128,14 +128,8 @@ The `--process` parameter must be the exact executable name of the game you want
   year         = {2025},
   note         = {Project repository: https://github.com/MineDojo/NitroGen}
 }
-
-@misc{nitrogen-trainpy-advisor,
-  title        = {NitroGen Custom Trainer (train.py) Advisor},
-  author       = {Zrorisc},
-  howpublished = {\url{https://discord.com/users/830771328810221598}},
-  year         = {2025},
-  note         = {Contributor for the full-featured trainer in scripts/train.py}
-}
 ```
+
+- Maintainer / train.py creator profile: <https://discord.com/users/830771328810221598>
 
 **Disclaimer**: This project is strictly for research purposes and is not an official NVIDIA product.
