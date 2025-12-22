@@ -17,6 +17,7 @@ NitroGen is an open foundation model for generalist gaming agents. This multi-ga
 NitroGen is trained through behavior cloning on the largest video-action gameplay dataset, assembled exclusively from internet videos. It can be adapted via post-training to unseen games.
 
 ## Custom Training (train.py by zrorisc)
+- Maintainer / creator profile: <https://discord.com/users/830771328810221598>
 
 This fork adds the missing full-featured trainer at `scripts/train.py` to fine-tune NitroGen on custom games. Use it with datasets produced by `convert_to_nitrogen.py` and the frame recorder/action mapper in https://github.com/taisrisk/frame-capture (25D NitroGen-compatible conversion lives there).
 
@@ -129,7 +130,5 @@ The `--process` parameter must be the exact executable name of the game you want
   note         = {Project repository: https://github.com/MineDojo/NitroGen}
 }
 ```
-
-- Maintainer / train.py creator profile: <https://discord.com/users/830771328810221598>
 
 **Disclaimer**: This project is strictly for research purposes and is not an official NVIDIA product.
