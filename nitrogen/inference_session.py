@@ -1,6 +1,7 @@
 import time
 import json
 from collections import deque
+from contextlib import nullcontext
 
 import torch
 import numpy as np
@@ -38,8 +39,13 @@ def summarize_parameters(module, name='model', depth=0, max_depth=3):
             summarize_parameters(child_module, child_name, depth + 1, max_depth)
 
 
-def load_model(checkpoint_path: str):
+def load_model(checkpoint_path: str, device: str = "cuda", weights_dtype: torch.dtype | None = None):
     """Load model and args from checkpoint."""
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"Requested device={device!r} but torch.cuda.is_available()=False. "
+            "Install a CUDA-enabled PyTorch build and/or run with the project venv python."
+        )
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ckpt_config = CkptConfig.model_validate(checkpoint["ckpt_config"])
     model_cfg = ckpt_config.model_cfg
@@ -64,7 +70,7 @@ def load_model(checkpoint_path: str):
         tokenizer = NitrogenTokenizer(tokenizer_cfg)
         game_mapping = tokenizer.game_mapping
         model = NitroGen(config=model_cfg, game_mapping=game_mapping)
-        # model.num_inference_timesteps = 16
+        model.num_inference_timesteps = 1
         action_downsample_ratio = 1
     else:
         raise ValueError(f"Unsupported model config type: {type(model_cfg)}")
@@ -76,7 +82,10 @@ def load_model(checkpoint_path: str):
     model.load_state_dict(checkpoint["model"])
     model.eval()
     tokenizer.eval()
-    model.to("cuda")
+    if weights_dtype is not None:
+        model.to(device=device, dtype=weights_dtype)
+    else:
+        model.to(device)
 
     return model, tokenizer, img_proc, ckpt_config, game_mapping, action_downsample_ratio
 
@@ -95,6 +104,9 @@ class InferenceSession:
         old_layout: bool,
         cfg_scale: float,
         action_downsample_ratio: float,
+        device: str = "cuda",
+        amp_dtype: torch.dtype | None = torch.bfloat16,
+        weights_dtype: torch.dtype | None = None,
         context_length=None
     ):
         self.model = model
@@ -107,6 +119,9 @@ class InferenceSession:
         self.cfg_scale = cfg_scale
         self.action_downsample_ratio = action_downsample_ratio
         self.ckpt_path = ckpt_path
+        self.device = device
+        self.amp_dtype = amp_dtype
+        self.weights_dtype = weights_dtype
 
         # Load modality config
         self.modality_config = self.ckpt_config.modality_cfg
@@ -120,9 +135,22 @@ class InferenceSession:
         self.action_buffer = deque(maxlen=self.max_buffer_size)
 
     @classmethod
-    def from_ckpt(cls, checkpoint_path: str, old_layout=False, cfg_scale=1.0, context_length=None):
+    def from_ckpt(
+        cls,
+        checkpoint_path: str,
+        old_layout: bool = False,
+        cfg_scale: float = 1.0,
+        context_length=None,
+        device: str = "cuda",
+        amp_dtype: torch.dtype | None = torch.bfloat16,
+        weights_dtype: torch.dtype | None = None,
+    ):
         """Create an InferenceSession from a checkpoint."""
-        model, tokenizer, img_proc, ckpt_config, game_mapping, action_downsample_ratio = load_model(checkpoint_path)
+        model, tokenizer, img_proc, ckpt_config, game_mapping, action_downsample_ratio = load_model(
+            checkpoint_path,
+            device=device,
+            weights_dtype=weights_dtype,
+        )
 
         if game_mapping is not None:
             # Ask user to pick a game from the list
@@ -155,7 +183,10 @@ class InferenceSession:
             old_layout,
             cfg_scale,
             action_downsample_ratio,
-            context_length
+            device=device,
+            amp_dtype=amp_dtype,
+            weights_dtype=weights_dtype,
+            context_length=context_length,
         )
 
     def info(self):
@@ -228,10 +259,13 @@ class InferenceSession:
     def _predict_flowmatching(self, pixel_values, action_tensors):
 
         available_frames = len(self.obs_buffer)
-        frames = torch.zeros((self.max_buffer_size, *pixel_values.shape[1:]), 
-                            dtype=pixel_values.dtype, device="cuda")
-        frames[-available_frames:] = pixel_values
-        dropped_frames = torch.zeros((self.max_buffer_size,), dtype=torch.bool, device="cuda")
+        frames = torch.zeros(
+            (self.max_buffer_size, *pixel_values.shape[1:]),
+            dtype=(self.amp_dtype or pixel_values.dtype),
+            device=self.device,
+        )
+        frames[-available_frames:] = pixel_values.to(device=self.device, dtype=frames.dtype)
+        dropped_frames = torch.zeros((self.max_buffer_size,), dtype=torch.bool, device=self.device)
         dropped_frames[:self.max_buffer_size - available_frames] = True
         
         data_with_history = {
@@ -241,7 +275,7 @@ class InferenceSession:
         }
         tokenized_data_with_history = self.tokenizer.encode(data_with_history)
         
-        frame_mask = torch.ones((self.max_buffer_size,), dtype=torch.bool, device="cuda")
+        frame_mask = torch.ones((self.max_buffer_size,), dtype=torch.bool, device=self.device)
         frame_mask[-1] = False
         data_without_history = {
             "frames": frames,
@@ -254,14 +288,19 @@ class InferenceSession:
         for tokenized_data in [tokenized_data_with_history, tokenized_data_without_history]:
             for k, v in tokenized_data.items():
                 if isinstance(v, torch.Tensor):
-                    tokenized_data[k] = v.unsqueeze(0).to("cuda")
+                    tokenized_data[k] = v.unsqueeze(0).to(self.device)
                 elif isinstance(v, np.ndarray):
-                    tokenized_data[k] = torch.tensor(v, device="cuda").unsqueeze(0)
+                    tokenized_data[k] = torch.tensor(v, device=self.device).unsqueeze(0)
                 else:
                     tokenized_data[k] = [v]
         
         with torch.inference_mode():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=self.amp_dtype)
+                if self.amp_dtype is not None and self.device.startswith("cuda")
+                else nullcontext()
+            )
+            with autocast_ctx:
                 if self.cfg_scale == 1.0:
                     model_output = self.model.get_action(tokenized_data_with_history, 
                                                         old_layout=self.old_layout)

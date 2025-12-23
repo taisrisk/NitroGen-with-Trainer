@@ -19,10 +19,22 @@ parser = argparse.ArgumentParser(description="VLM Inference")
 parser.add_argument("--process", type=str, default="celeste.exe", help="Game to play")
 parser.add_argument("--allow-menu", action="store_true", help="Allow menu actions (Disabled by default)")
 parser.add_argument("--port", type=int, default=5555, help="Port for model server")
+parser.add_argument("--timeout-ms", type=int, default=120_000, help="Model server receive timeout (ms)")
+parser.add_argument("--focus-each-step", action="store_true", help="Refocus the game window each step (helps some games accept virtual controller)")
+parser.add_argument("--env-fps", type=int, default=30, help="Gamepad action FPS (lower improves capture stability)")
+parser.add_argument("--obs-width", type=int, default=1280, help="Captured observation width (resized)")
+parser.add_argument("--obs-height", type=int, default=720, help="Captured observation height (resized)")
+parser.add_argument("--screenshot-backend", choices=["dxcam", "pyautogui"], default="dxcam", help="Screenshot backend")
+parser.add_argument("--capture-margin", type=int, default=0, help="Crop margin (pixels) from each window edge before capture")
+parser.add_argument("--reuse-last-frame-on-fail", action=argparse.BooleanOptionalAction, default=False, help="If capture fails, reuse the previous frame instead of waiting")
+parser.add_argument("--capture-retry-delay-ms", type=int, default=20, help="Delay between capture retries (ms)")
+parser.add_argument("--capture-hard-fail-after", type=int, default=5, help="After N consecutive capture fails, pause actions more aggressively")
+parser.add_argument("--capture-hard-fail-sleep-ms", type=int, default=1000, help="Extra sleep after hard-fail threshold (ms)")
+parser.add_argument("--test-controller", action="store_true", help="Interactive controller sanity test before running the model loop")
 
 args = parser.parse_args()
 
-policy = ModelClient(port=args.port)
+policy = ModelClient(port=args.port, timeout_ms=args.timeout_ms)
 policy.reset()
 policy_info = policy.info()
 action_downsample_ratio = policy_info["action_downsample_ratio"]
@@ -67,16 +79,16 @@ zero_action = OrderedDict(
             ("DPAD_RIGHT", 0),
             ("DPAD_UP", 0),
             ("GUIDE", 0),
-            ("AXIS_LEFTX", np.array([0], dtype=np.long)),
-            ("AXIS_LEFTY", np.array([0], dtype=np.long)),
+            ("AXIS_LEFTX", np.array([0], dtype=np.int32)),
+            ("AXIS_LEFTY", np.array([0], dtype=np.int32)),
             ("LEFT_SHOULDER", 0),
-            ("LEFT_TRIGGER", np.array([0], dtype=np.long)),
-            ("AXIS_RIGHTX", np.array([0], dtype=np.long)),
-            ("AXIS_RIGHTY", np.array([0], dtype=np.long)),
+            ("LEFT_TRIGGER", np.array([0], dtype=np.int32)),
+            ("AXIS_RIGHTX", np.array([0], dtype=np.int32)),
+            ("AXIS_RIGHTY", np.array([0], dtype=np.int32)),
             ("LEFT_THUMB", 0),
             ("RIGHT_THUMB", 0),
             ("RIGHT_SHOULDER", 0),
-            ("RIGHT_TRIGGER", np.array([0], dtype=np.long)),
+            ("RIGHT_TRIGGER", np.array([0], dtype=np.int32)),
             ("START", 0),
             ("EAST", 0),
             ("NORTH", 0),
@@ -93,8 +105,17 @@ for i in range(3):
 env = GamepadEnv(
     game=args.process,
     game_speed=1.0,
-    env_fps=60,
+    env_fps=args.env_fps,
     async_mode=True,
+    focus_each_step=args.focus_each_step,
+    image_width=args.obs_width,
+    image_height=args.obs_height,
+    screenshot_backend=args.screenshot_backend,
+    capture_margin=args.capture_margin,
+    reuse_last_frame_on_capture_fail=args.reuse_last_frame_on_fail,
+    capture_retry_delay_s=args.capture_retry_delay_ms / 1000.0,
+    hard_fail_after=args.capture_hard_fail_after,
+    hard_fail_sleep_s=args.capture_hard_fail_sleep_ms / 1000.0,
 )
 
 # These games requires to open a menu to initialize the controller
@@ -139,6 +160,14 @@ if args.process == "Cuphead.exe":
 env.reset()
 env.pause()
 
+# Optional controller sanity test before letting the model run.
+if args.test_controller:
+    input("Press Enter to test left stick (should move camera/menu)...")
+    test_action = zero_action.copy()
+    test_action["AXIS_LEFTX"] = np.array([32767], dtype=np.int32)
+    for _ in range(60):
+        obs, reward, terminated, truncated, info = env.step(action=test_action)
+    input("Press Enter to continue into model loop...")
 
 # Initial call to get state
 obs, reward, terminated, truncated, info = env.step(action=zero_action)
@@ -168,10 +197,10 @@ with VideoRecorder(str(PATH_MP4_DEBUG), fps=60, crf=32, preset="medium") as debu
 
                     xl, yl = j_left[i]
                     xr, yr = j_right[i]
-                    move_action["AXIS_LEFTX"] = np.array([int(xl * 32767)], dtype=np.long)
-                    move_action["AXIS_LEFTY"] = np.array([int(yl * 32767)], dtype=np.long)
-                    move_action["AXIS_RIGHTX"] = np.array([int(xr * 32767)], dtype=np.long)
-                    move_action["AXIS_RIGHTY"] = np.array([int(yr * 32767)], dtype=np.long)
+                    move_action["AXIS_LEFTX"] = np.array([int(xl * 32767)], dtype=np.int32)
+                    move_action["AXIS_LEFTY"] = np.array([int(yl * 32767)], dtype=np.int32)
+                    move_action["AXIS_RIGHTX"] = np.array([int(xr * 32767)], dtype=np.int32)
+                    move_action["AXIS_RIGHTY"] = np.array([int(yr * 32767)], dtype=np.int32)
                     
                     button_vector = buttons[i]
                     assert len(button_vector) == len(TOKEN_SET), "Button vector length does not match token set length"
@@ -179,7 +208,7 @@ with VideoRecorder(str(PATH_MP4_DEBUG), fps=60, crf=32, preset="medium") as debu
                     
                     for name, value in zip(TOKEN_SET, button_vector):
                         if "TRIGGER" in name:
-                            move_action[name] =  np.array([value * 255], dtype=np.long)
+                            move_action[name] = np.array([int(value * 255)], dtype=np.int32)
                         else:
                             move_action[name] = 1 if value > BUTTON_PRESS_THRES else 0
 
