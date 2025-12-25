@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "aio",
+  "description": "All-in-one default (PC KB/M -> Xbox controller tokens). Movement/camera handled via sticks; this profile maps discrete keys/buttons with sensible defaults and uses 'RIGHT_*' tokens as ghost slots.",
+  "bindings": {
+    "RIGHT_TRIGGER": ["lmb"],
+    "LEFT_TRIGGER": ["rmb"],
+    "LEFT_SHOULDER": ["q"],
+    "RIGHT_SHOULDER": ["r"],
+    "LEFT_THUMB": ["shift"],
+    "RIGHT_THUMB": ["ctrl"],
+    "SOUTH": ["space", "e", "enter"],
+    "NORTH": ["f"],
+    "WEST": ["x"],
+    "EAST": ["c"],
+    "START": ["esc"],
+    "BACK": ["i"],
+    "DPAD_LEFT": ["1"],
+    "DPAD_UP": ["2"],
+    "DPAD_RIGHT": ["3"],
+    "DPAD_DOWN": ["4"],
+    "RIGHT_LEFT": ["g", "x"],
+    "RIGHT_UP": ["c", "i"],
+    "RIGHT_RIGHT": ["f", "z"],
+    "RIGHT_BOTTOM": ["v"]
+  }
+}

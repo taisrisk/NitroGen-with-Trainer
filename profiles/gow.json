@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "name": "gow",
+  "description": "God of War Ragnarok (PC KB/M -> Xbox controller tokens). Movement/camera handled via sticks; this profile maps discrete buttons/triggers.",
+  "bindings": {
+    "RIGHT_SHOULDER": ["lmb"],
+    "RIGHT_TRIGGER": ["rmb"],
+    "LEFT_TRIGGER": ["ctrl"],
+    "LEFT_SHOULDER": ["q"],
+    "LEFT_THUMB": ["shift"],
+    "NORTH": ["r"],
+    "SOUTH": ["e", "enter"],
+    "EAST": ["space"],
+    "START": ["esc"],
+    "DPAD_LEFT": ["1"],
+    "DPAD_RIGHT": ["2"],
+    "DPAD_DOWN": ["3"],
+    "RIGHT_LEFT": ["g", "x"],
+    "RIGHT_RIGHT": ["f", "z"],
+    "RIGHT_UP": ["c", "i"],
+    "RIGHT_BOTTOM": ["v"]
+  }
+}
