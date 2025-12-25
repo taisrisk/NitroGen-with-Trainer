@@ -12,6 +12,8 @@ Credits:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, Tuple
 import time
@@ -89,6 +91,67 @@ def _tokenizer_fingerprint(tokenizer: NitrogenTokenizer | None) -> dict:
         "game_mapping_size": len(getattr(tokenizer, "game_mapping", {}) or {}),
     }
 
+def _profile_sha256(profile_obj: dict) -> str:
+    payload = json.dumps(profile_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _resolve_profile_path(profile: str) -> Path:
+    s = str(profile or "").strip()
+    if not s:
+        raise ValueError("Empty --profile")
+    # If a path was provided (or a .json filename), honor it.
+    if any(sep in s for sep in ("/", "\\", ":")) or s.lower().endswith(".json"):
+        p = Path(s)
+        if p.is_absolute():
+            return p
+        # Prefer repo-relative paths, then fall back to CWD-relative.
+        repo_rel = (PATH_REPO / p).resolve()
+        if repo_rel.exists():
+            return repo_rel
+        return (Path.cwd() / p).resolve()
+    return (PATH_REPO / "profiles" / f"{s}.json").resolve()
+
+
+def load_profile(profile: str) -> dict:
+    path = _resolve_profile_path(profile)
+    if not path.exists():
+        raise FileNotFoundError(f"Profile not found: {path}")
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError(f"Invalid profile JSON (expected object): {path}")
+    version = obj.get("version", None)
+    if int(version or 0) != 1:
+        raise ValueError(f"Unsupported profile version {version!r} in {path} (expected 1)")
+    name = str(obj.get("name") or path.stem).strip().lower()
+    bindings = obj.get("bindings")
+    if not isinstance(bindings, dict):
+        raise ValueError(f"Profile {path} missing 'bindings' dict")
+    norm_bindings: dict[str, list[str]] = {}
+    for token, keys in bindings.items():
+        token_s = str(token).strip().upper()
+        if token_s not in BUTTON_ACTION_TOKENS:
+            raise ValueError(f"Profile {path} references unknown controller token {token_s!r}")
+        if isinstance(keys, str):
+            keys_list = [keys]
+        elif isinstance(keys, (list, tuple)):
+            keys_list = list(keys)
+        else:
+            raise ValueError(f"Profile {path} binding for {token_s} must be string or list of strings")
+        norm_keys = [str(k).strip().lower() for k in keys_list if str(k).strip()]
+        for k in norm_keys:
+            if k in {"lx", "ly", "rx", "ry"}:
+                raise ValueError(f"Profile {path} must not bind analog axes {k!r} as buttons")
+        norm_bindings[token_s] = norm_keys
+    return {
+        "version": 1,
+        "name": name,
+        "description": str(obj.get("description") or ""),
+        "bindings": norm_bindings,
+        "path": str(path),
+        "sha256": _profile_sha256({"version": 1, "name": name, "bindings": norm_bindings}),
+    }
+
 
 def _atomic_torch_save(obj: object, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +167,7 @@ def _preencode_cache_matches(
     tokenizer: NitrogenTokenizer | None,
     context_frames: int,
     frame_spacing: int,
+    profile_sha256: str,
 ) -> bool:
     if not isinstance(cached, dict):
         return False
@@ -129,10 +193,11 @@ def _preencode_cache_matches(
                 return False
             if int(preencode_meta.get("frame_spacing", -1)) != int(frame_spacing):
                 return False
+            if str(preencode_meta.get("profile_sha256", "")) != str(profile_sha256):
+                return False
         else:
             # Old caches didn't include preencode settings; those were always 1-frame.
-            if int(context_frames) != 1:
-                return False
+            return False
 
         tok_meta = cached.get("tokenizer")
         if isinstance(tok_meta, dict) and tok_meta:
@@ -140,13 +205,7 @@ def _preencode_cache_matches(
         return True
 
     # Back-compat: accept equivalent paths even if absolute/relative differs.
-    if int(context_frames) != 1:
-        return False
-    cached_path = cached.get("data_path")
-    cached_norm = cached.get("data_path_norm")
-    if cached_norm is not None:
-        return str(cached_norm) == _norm_path(data_path)
-    return _paths_equivalent(cached_path, data_path)
+    return False
 
 
 def _cuda_mem() -> str:
@@ -181,11 +240,9 @@ def _default_action_names_for_dim(action_dim: int) -> list[str]:
         "3",
         "4",
     ]
-    if action_dim == 20:
-        return base
     if action_dim == 25:
         return base + ["x", "z", "enter", "esc", "i"]
-    return [f"dim_{i}" for i in range(action_dim)]
+    raise ValueError(f"Unsupported action_dim {action_dim}; this project requires 25D actions.")
 
 
 def _action_col(action_seq: np.ndarray, action_names: list[str] | None, *names: str) -> np.ndarray:
@@ -216,19 +273,11 @@ def _safe_action_col_by_index(action_seq: np.ndarray, idx: int) -> np.ndarray:
     return np.zeros((action_seq.shape[0],), dtype=np.float32)
 
 
-def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None, *, profile: str = "gow") -> np.ndarray:
+def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None, *, bindings: dict[str, list[str]]) -> np.ndarray:
     """
-    Map converter action layout (usually 20D or 25D, names like 'space', 'ctrl', 'lmb')
+    Map converter action layout (25D, names like 'space', 'ctrl', 'lmb')
     into NitroGen button tensor aligned with BUTTON_ACTION_TOKENS.
     """
-    return map_buttons_profile(action_seq, action_names=action_names, profile=profile)
-
-
-def map_buttons_profile(action_seq: np.ndarray, action_names: list[str] | None = None, *, profile: str) -> np.ndarray:
-    profile = str(profile or "").strip().lower()
-    if profile not in {"gow", "fps"}:
-        raise ValueError(f"Unknown control profile {profile!r} (expected 'gow' or 'fps').")
-
     btn = np.zeros((action_seq.shape[0], len(BUTTON_ACTION_TOKENS)), dtype=np.float32)
     idx = {name: BUTTON_ACTION_TOKENS.index(name) for name in BUTTON_ACTION_TOKENS}
 
@@ -243,73 +292,14 @@ def map_buttons_profile(action_seq: np.ndarray, action_names: list[str] | None =
             return np.zeros((action_seq.shape[0],), dtype=np.float32)
         return _safe_action_col_by_index(action_seq, fallback_idx)
 
-    if profile == "gow":
-        # God of War Ragnarök (PC keyboard/mouse -> Xbox controller layout)
-        # Ground-truth mapping (from your description):
-        # - Light attack: LMB  (holdable) -> R1
-        # - Heavy attack: RMB  (holdable) -> R2
-        # - Run: Shift (hold) -> L3
-        # - Aim: Ctrl (hold)  -> L2
-        # - Special ability: Q + (LMB/RMB) -> L1+R1 / L1+R2 (Runic attacks)
-        # - Power up weapon: R (hold) -> Y
-        # - Weapons: 1/2/3 -> D-pad (tunable)
-        #
-        # Notes:
-        # - Movement/camera handled via sticks (WASD + mouse deltas) elsewhere.
-        # - Using Q as L1 means Q+click automatically becomes L1+R1/L1+R2.
-        btn[:, idx["RIGHT_SHOULDER"]] = col("lmb", fallback_idx=8)  # R1 light
-        btn[:, idx["RIGHT_TRIGGER"]] = col("rmb", fallback_idx=9)  # R2 heavy
-        btn[:, idx["LEFT_TRIGGER"]] = col("ctrl", fallback_idx=5)  # L2 aim
-        btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)  # L1 (runic modifier)
-        btn[:, idx["LEFT_THUMB"]] = col("shift", fallback_idx=6)  # L3 run
-
-        # Interact / confirm: E (interact) and Enter (confirm)
-        btn[:, idx["SOUTH"]] = np.maximum(col("e", fallback_idx=7), col("enter", fallback_idx=22))  # A
-
-        # Menu / pause
-        btn[:, idx["START"]] = col("esc", "escape", fallback_idx=23)
-
-        # Power up weapon: R (hold)
-        btn[:, idx["NORTH"]] = col("r", fallback_idx=11)  # Y
-
-        # Weapon select (can adjust later if you want different D-pad directions)
-        btn[:, idx["DPAD_LEFT"]] = col("1", fallback_idx=16)
-        btn[:, idx["DPAD_RIGHT"]] = col("2", fallback_idx=17)
-        btn[:, idx["DPAD_DOWN"]] = col("3", fallback_idx=18)
-
-        # "Ghost" bindings for now (tokens not consumed by GamepadEmulator.step)
-        btn[:, idx["RIGHT_LEFT"]] = col("g", fallback_idx=13)
-        btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
-        btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
-        btn[:, idx["RIGHT_RIGHT"]] = col("f", fallback_idx=12)
-        btn[:, idx["RIGHT_LEFT"]] = np.maximum(btn[:, idx["RIGHT_LEFT"]], col("x", fallback_idx=20))
-        btn[:, idx["RIGHT_RIGHT"]] = np.maximum(btn[:, idx["RIGHT_RIGHT"]], col("z", fallback_idx=21))
-        btn[:, idx["RIGHT_UP"]] = np.maximum(btn[:, idx["RIGHT_UP"]], col("i", fallback_idx=24))
-    else:
-        # FPS-style baseline (useful for shooters):
-        # - L2 aim: RMB
-        # - R2 fire: LMB
-        # - R1: R
-        # - L1: Q
-        # - A: Space
-        btn[:, idx["LEFT_TRIGGER"]] = col("rmb", fallback_idx=9)
-        btn[:, idx["RIGHT_TRIGGER"]] = col("lmb", fallback_idx=8)
-        btn[:, idx["RIGHT_SHOULDER"]] = col("r", fallback_idx=11)
-        btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)
-        btn[:, idx["LEFT_THUMB"]] = col("f", fallback_idx=12)
-        btn[:, idx["RIGHT_THUMB"]] = col("g", fallback_idx=13)
-
-        btn[:, idx["SOUTH"]] = col("space", fallback_idx=4)
-        btn[:, idx["WEST"]] = col("x", fallback_idx=20)
-        btn[:, idx["EAST"]] = col("ctrl", fallback_idx=5)
-        btn[:, idx["NORTH"]] = col("e", fallback_idx=7)
-        btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
-        btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
-
-    # System/menu (leave on the baseline profile)
-    if profile != "gow":
-        btn[:, idx["BACK"]] = col("esc", "escape", fallback_idx=23)
-        btn[:, idx["START"]] = col("enter", "return", fallback_idx=22)
+    for token, keys in bindings.items():
+        token_idx = idx[token]
+        if not keys:
+            continue
+        v = np.zeros((action_seq.shape[0],), dtype=np.float32)
+        for key in keys:
+            v = np.maximum(v, col(key))
+        btn[:, token_idx] = v
     return btn
 
 
@@ -326,7 +316,7 @@ class NitroGenDataset(Dataset):
         action_horizon: int,
         context_frames: int = 1,
         frame_spacing: int = 1,
-        control_profile: str = "gow",
+        profile: dict | None = None,
         expected_action_dim: int | None = 25,
         game: str | None = None,
         tokenizer: NitrogenTokenizer | None = None,
@@ -351,25 +341,28 @@ class NitroGenDataset(Dataset):
         self.tokenizer = tokenizer
         self.context_frames = int(context_frames)
         self.frame_spacing = int(frame_spacing)
-        self.control_profile = str(control_profile or "").strip().lower()
+        self.profile = profile or {}
+        self.profile_name = str(self.profile.get("name") or "unknown")
+        self.profile_sha256 = str(self.profile.get("sha256") or "")
+        self.profile_bindings = self.profile.get("bindings") if isinstance(self.profile.get("bindings"), dict) else {}
         self._encoded: list[dict] | None = None
 
         if self.context_frames < 1:
             raise ValueError(f"context_frames must be >= 1, got {self.context_frames}")
         if self.frame_spacing < 1:
             raise ValueError(f"frame_spacing must be >= 1, got {self.frame_spacing}")
-        if self.control_profile not in {"gow", "fps"}:
-            raise ValueError(f"Unknown control_profile {self.control_profile!r} (expected 'gow' or 'fps').")
+        if not self.profile_sha256 or not self.profile_bindings:
+            raise ValueError(f"Invalid profile loaded (name={self.profile_name!r})")
 
         if self.actions.ndim != 3:
             raise ValueError(f"Expected actions shape (N, T, A), got {self.actions.shape}")
         if expected_action_dim is not None and self.actions.shape[-1] != expected_action_dim:
             raise ValueError(
                 f"Dataset action_dim={self.actions.shape[-1]} does not match expected_action_dim={expected_action_dim}. "
-                "Re-run convert_to_nitrogen.py with --action-dim 25 (NitroGen/serve.py default)."
+                "Re-run convert_to_nitrogen.py (this project requires 25D actions)."
             )
-        if expected_action_dim is None and self.actions.shape[-1] not in (20, 25):
-            raise ValueError(f"Expected converter action_dim 20 or 25, got {self.actions.shape[-1]}D.")
+        if expected_action_dim is None and self.actions.shape[-1] != 25:
+            raise ValueError(f"Expected converter action_dim 25, got {self.actions.shape[-1]}D.")
         if self.actions.shape[1] != action_horizon:
             raise ValueError(
                 f"Dataset horizon T={self.actions.shape[1]} does not match model action_horizon={action_horizon}. "
@@ -381,6 +374,18 @@ class NitroGenDataset(Dataset):
             raise ValueError(
                 f"meta.action_names length ({len(self.action_names)}) does not match action_dim ({self.actions.shape[-1]})."
             )
+        available_action_names = (
+            set([str(x).strip().lower() for x in self.action_names])
+            if self.action_names is not None
+            else set([str(x).strip().lower() for x in _default_action_names_for_dim(int(self.actions.shape[-1]))])
+        )
+        for token, keys in self.profile_bindings.items():
+            for k in keys:
+                if k not in available_action_names:
+                    raise ValueError(
+                        f"Profile {self.profile_name!r} references unknown action name {k!r} for token {token!r}. "
+                        f"Available names include: {sorted(list(available_action_names))[:12]}..."
+                    )
         if preencode and tokenizer is None:
             raise ValueError("preencode=True requires a tokenizer")
         if preencode:
@@ -395,6 +400,7 @@ class NitroGenDataset(Dataset):
                         tokenizer=tokenizer,
                         context_frames=self.context_frames,
                         frame_spacing=self.frame_spacing,
+                        profile_sha256=self.profile_sha256,
                     ):
                         encoded = cached.get("encoded")
                         if not isinstance(encoded, list) or len(encoded) != len(self):
@@ -426,6 +432,8 @@ class NitroGenDataset(Dataset):
                             "preencode": {
                                 "context_frames": int(self.context_frames),
                                 "frame_spacing": int(self.frame_spacing),
+                                "profile_name": str(self.profile_name),
+                                "profile_sha256": str(self.profile_sha256),
                             },
                             # Back-compat keys (older trainers used these):
                             "data_path": str(path),
@@ -469,7 +477,7 @@ class NitroGenDataset(Dataset):
         pixel_values = self.image_processor(frames_hwc, return_tensors="pt")["pixel_values"]
 
         action_seq = self.actions[idx].astype(np.float32)
-        buttons = torch.from_numpy(map_buttons(action_seq, self.action_names, profile=self.control_profile)).unsqueeze(0)
+        buttons = torch.from_numpy(map_buttons(action_seq, self.action_names, bindings=self.profile_bindings)).unsqueeze(0)
 
         # Joystick axes come from the converter layout; prefer name-based extraction when available.
         if self.action_names is not None:
@@ -599,10 +607,16 @@ def parse_args() -> argparse.Namespace:
         help="Override ckpt_config.modality_cfg.frame_spacing (dataset index step between context frames)",
     )
     p.add_argument(
+        "--profile",
+        type=str,
+        default="aio",
+        help="Control profile name (loads profiles/<name>.json) or a path to a .json profile.",
+    )
+    p.add_argument(
         "--control-profile",
-        choices=("gow", "fps"),
-        default="gow",
-        help="How to map recorded keyboard/mouse buttons into controller buttons/triggers (default: gow).",
+        type=str,
+        default=None,
+        help="Deprecated alias for --profile.",
     )
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=1)
@@ -657,6 +671,11 @@ def main() -> None:
         print(f"[{_ts()}] [debug] args={vars(args)}")
 
     model, tokenizer, cfg, base_step, base_epoch = load_base_ckpt(args.base_ckpt, debug=args.debug)
+    profile_arg = args.profile
+    if getattr(args, "control_profile", None):
+        profile_arg = args.control_profile
+    profile = load_profile(str(profile_arg))
+    print(f"[{_ts()}] [profile] loaded name={profile['name']} sha256={profile['sha256'][:8]} path={profile['path']}")
     modality_update: dict = {}
     if args.context_frames is not None:
         modality_update["frame_per_sample"] = int(args.context_frames)
@@ -709,7 +728,7 @@ def main() -> None:
         action_horizon=model_horizon,
         context_frames=getattr(cfg.modality_cfg, "frame_per_sample", 1),
         frame_spacing=getattr(cfg.modality_cfg, "frame_spacing", 1) or 1,
-        control_profile=str(args.control_profile),
+        profile=profile,
         expected_action_dim=getattr(cfg.model_cfg, "action_dim", 25),
         game=args.game,
         tokenizer=tokenizer if args.preencode else None,
