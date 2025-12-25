@@ -11,6 +11,7 @@ import numpy as np
 
 from nitrogen.inference_session import InferenceSession
 
+
 def _install_gc_logger():
     start_times_by_gen = {}
 
