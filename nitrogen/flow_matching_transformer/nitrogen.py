@@ -182,8 +182,22 @@ class NitroGen(torch.nn.Module):
         self.vision_hidden_size = config.vision_hidden_size
 
         if "siglip" in config.vision_encoder_name:
-            model = SiglipVisionModel.from_pretrained(config.vision_encoder_name)
-            self.vision_encoder = model.vision_model
+            # Some checkpoints (e.g. SigLIP2) may ship a combined SiglipConfig in older
+            # transformers builds; SiglipVisionModel.from_pretrained() can fail in that
+            # case. Fall back to AutoModel and extract the vision tower.
+            try:
+                model = SiglipVisionModel.from_pretrained(config.vision_encoder_name)
+                self.vision_encoder = model.vision_model
+            except Exception:
+                model = AutoModel.from_pretrained(config.vision_encoder_name)
+                if hasattr(model, "vision_model"):
+                    self.vision_encoder = model.vision_model
+                    # Drop references to non-vision parts to free memory when possible.
+                    for attr in ("text_model", "text_projection", "logit_scale"):
+                        if hasattr(model, attr):
+                            setattr(model, attr, None)
+                else:
+                    self.vision_encoder = model
             self.vision_encoder_type = "siglip"
         else:
             self.vision_encoder = AutoModel.from_pretrained(config.vision_encoder_name)

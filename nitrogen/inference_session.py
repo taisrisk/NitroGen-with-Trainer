@@ -129,6 +129,7 @@ def load_model(
     weights_path: str | None = None,
     weights_strict: bool = True,
     context_length: int | None = None,
+    old_layout: bool | None = None,
 ):
     """Load model and args from checkpoint."""
     if device.startswith("cuda") and not torch.cuda.is_available():
@@ -136,10 +137,47 @@ def load_model(
             f"Requested device={device!r} but torch.cuda.is_available()=False. "
             "Install a CUDA-enabled PyTorch build and/or run with the project venv python."
         )
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    effective_ckpt_path = str(checkpoint_path)
+    effective_weights_path = str(weights_path) if weights_path is not None else None
+
+    checkpoint = torch.load(effective_ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "ckpt_config" not in checkpoint or "model" not in checkpoint:
+        raise ValueError(f"Invalid checkpoint at {effective_ckpt_path!r} (expected keys: ckpt_config, model)")
+
+    # If --weights points at a full checkpoint with a different architecture/config (e.g. keyboard action_dim),
+    # treat it as the actual checkpoint and ignore the base ckpt file.
+    if effective_weights_path is not None:
+        try:
+            weights_obj = torch.load(effective_weights_path, map_location="cpu", weights_only=False)
+        except Exception:
+            weights_obj = None
+        if isinstance(weights_obj, dict) and "ckpt_config" in weights_obj and ("model" in weights_obj or "model_state" in weights_obj):
+            try:
+                base_cfg = CkptConfig.model_validate(checkpoint["ckpt_config"])
+                w_cfg = CkptConfig.model_validate(weights_obj["ckpt_config"])
+                base_action_dim = int(getattr(base_cfg.model_cfg, "action_dim", 0) or 0)
+                w_action_dim = int(getattr(w_cfg.model_cfg, "action_dim", 0) or 0)
+                if w_action_dim and base_action_dim and w_action_dim != base_action_dim:
+                    print(
+                        f"[warn] --weights looks like a full checkpoint with action_dim={w_action_dim} "
+                        f"(base action_dim={base_action_dim}); treating --weights as the checkpoint and ignoring base ckpt."
+                    )
+                    checkpoint = weights_obj
+                    effective_ckpt_path = effective_weights_path
+                    effective_weights_path = None
+            except Exception:
+                pass
+
     ckpt_config = CkptConfig.model_validate(checkpoint["ckpt_config"])
     model_cfg = ckpt_config.model_cfg
     tokenizer_cfg = ckpt_config.tokenizer_cfg
+
+    action_space = str(checkpoint.get("action_space") or "").strip().lower() if isinstance(checkpoint, dict) else ""
+    button_names = checkpoint.get("button_names") if isinstance(checkpoint, dict) else None
+    if not isinstance(button_names, (list, tuple)):
+        button_names = None
+    else:
+        button_names = [str(x).strip().lower() for x in button_names if str(x).strip()]
 
     print("Checkpoint args:")
     print(json.dumps(ckpt_config.model_dump(), indent=4))
@@ -158,6 +196,11 @@ def load_model(
                 for x in tokenizer_cfg.game_mapping_cfg.src_files
             ]
         tokenizer = NitrogenTokenizer(tokenizer_cfg)
+        if old_layout is not None:
+            try:
+                tokenizer.old_layout = bool(old_layout)
+            except Exception:
+                pass
         game_mapping = tokenizer.game_mapping
         model = NitroGen(config=model_cfg, game_mapping=game_mapping)
         # model.num_inference_timesteps = 1
@@ -176,18 +219,18 @@ def load_model(
     )
 
     model.load_state_dict(checkpoint["model"])
-    print(f"[config] base_ckpt={checkpoint_path}")
-    if weights_path is not None:
-        weights_obj = torch.load(weights_path, map_location="cpu", weights_only=False)
+    print(f"[config] base_ckpt={effective_ckpt_path}")
+    if effective_weights_path is not None:
+        weights_obj = torch.load(effective_weights_path, map_location="cpu", weights_only=False)
         state_dict = _extract_state_dict(weights_obj)
         try:
             load_res = model.load_state_dict(state_dict, strict=bool(weights_strict))
         except RuntimeError as e:
             raise RuntimeError(
-                f"Failed to load --weights={weights_path!r} onto base ckpt={checkpoint_path!r}. "
+                f"Failed to load --weights={effective_weights_path!r} onto base ckpt={effective_ckpt_path!r}. "
                 f"This usually means a config/architecture mismatch. ({e})"
             ) from e
-        print(f"[config] override_weights={weights_path} (strict={bool(weights_strict)})")
+        print(f"[config] override_weights={effective_weights_path} (strict={bool(weights_strict)})")
         if (not bool(weights_strict)) and (load_res.missing_keys or load_res.unexpected_keys):
             print(
                 f"[warn] loaded weights with mismatches: missing={len(load_res.missing_keys)} "
@@ -200,7 +243,18 @@ def load_model(
     else:
         model.to(device)
 
-    return model, tokenizer, img_proc, ckpt_config, game_mapping, action_downsample_ratio
+    return (
+        model,
+        tokenizer,
+        img_proc,
+        ckpt_config,
+        game_mapping,
+        action_downsample_ratio,
+        button_names,
+        action_space,
+        effective_ckpt_path,
+        effective_weights_path,
+    )
 
 class InferenceSession:
     """Manages state for a single inference session."""
@@ -218,6 +272,9 @@ class InferenceSession:
         old_layout: bool,
         cfg_scale: float,
         action_downsample_ratio: float,
+        button_names: list[str] | None = None,
+        action_space: str | None = None,
+        debug: bool = False,
         device: str = "cuda",
         amp_dtype: torch.dtype | None = torch.bfloat16,
         weights_dtype: torch.dtype | None = None,
@@ -234,9 +291,12 @@ class InferenceSession:
         self.action_downsample_ratio = action_downsample_ratio
         self.ckpt_path = ckpt_path
         self.weights_path = weights_path
+        self.button_names = list(button_names) if isinstance(button_names, list) and button_names else None
+        self.action_space = str(action_space).strip().lower() if action_space else None
         self.device = device
         self.amp_dtype = amp_dtype
         self.weights_dtype = weights_dtype
+        self.debug = bool(debug)
 
         # Load modality config
         self.modality_config = self.ckpt_config.modality_cfg
@@ -261,15 +321,28 @@ class InferenceSession:
         device: str = "cuda",
         amp_dtype: torch.dtype | None = torch.bfloat16,
         weights_dtype: torch.dtype | None = None,
+        debug: bool = False,
     ):
         """Create an InferenceSession from a checkpoint."""
-        model, tokenizer, img_proc, ckpt_config, game_mapping, action_downsample_ratio = load_model(
+        (
+            model,
+            tokenizer,
+            img_proc,
+            ckpt_config,
+            game_mapping,
+            action_downsample_ratio,
+            button_names,
+            action_space,
+            effective_ckpt_path,
+            effective_weights_path,
+        ) = load_model(
             checkpoint_path,
             device=device,
             weights_dtype=weights_dtype,
             weights_path=weights_path,
             weights_strict=weights_strict,
             context_length=context_length,
+            old_layout=old_layout,
         )
 
         if game_mapping is not None:
@@ -294,8 +367,8 @@ class InferenceSession:
 
         return cls(
             model,
-            checkpoint_path,
-            weights_path,
+            effective_ckpt_path,
+            effective_weights_path,
             tokenizer,
             img_proc,
             ckpt_config,
@@ -304,6 +377,9 @@ class InferenceSession:
             old_layout,
             cfg_scale,
             action_downsample_ratio,
+            button_names=button_names,
+            action_space=action_space,
+            debug=debug,
             device=device,
             amp_dtype=amp_dtype,
             weights_dtype=weights_dtype,
@@ -311,7 +387,7 @@ class InferenceSession:
         )
 
     def info(self):
-        return {
+        info = {
             "ckpt_path": self.ckpt_path,
             "weights_path": self.weights_path,
             "selected_game": self.selected_game,
@@ -321,7 +397,13 @@ class InferenceSession:
             "action_interleaving": self.action_interleaving,
             "is_flowmatching": self.is_flowmatching,
             "action_downsample_ratio": self.action_downsample_ratio,
+            "action_dim": int(getattr(self.ckpt_config.model_cfg, "action_dim", 0) or 0),
         }
+        if self.action_space:
+            info["action_space"] = self.action_space
+        if self.button_names:
+            info["button_names"] = list(self.button_names)
+        return info
 
     def reset(self):
         """Reset all buffers."""
@@ -345,14 +427,16 @@ class InferenceSession:
         else:
             action_tensors = {"buttons": None, "j_left": None, "j_right": None}
 
-        print("Running inference with the following inputs:")
-        print(f"- pixel_values: {pixel_values.shape}")
-        print("- action_tensors:")
-        for k, v in action_tensors.items():
-            if v is not None:
-                print(f"  - {k}: {v.shape}")
-            else:
-                print(f"  - {k}: None")
+        if self.debug:
+            print("Running inference with the following inputs:")
+            print(f"- pixel_values: {pixel_values.shape}")
+            print(f"- action_interleaving: {self.action_interleaving} (action_buffer_len={len(self.action_buffer)})")
+            print("- cond_action_tensors:")
+            for k, v in action_tensors.items():
+                if v is not None:
+                    print(f"  - {k}: {v.shape}")
+                else:
+                    print(f"  - {k}: None")
 
         # Run inference
         if self.is_flowmatching:
@@ -364,7 +448,20 @@ class InferenceSession:
         self.action_buffer.append(predicted_actions)
         
         inference_time = time.time() - start_time
-        print(f"Inference time: {inference_time:.3f}s")
+        if self.debug:
+            try:
+                b = predicted_actions.get("buttons")
+                jl = predicted_actions.get("j_left")
+                jr = predicted_actions.get("j_right")
+                print(
+                    "Outputs:"
+                    f" buttons={tuple(b.shape) if hasattr(b, 'shape') else type(b).__name__}"
+                    f" j_left={tuple(jl.shape) if hasattr(jl, 'shape') else type(jl).__name__}"
+                    f" j_right={tuple(jr.shape) if hasattr(jr, 'shape') else type(jr).__name__}"
+                )
+            except Exception:
+                pass
+            print(f"Inference time: {inference_time:.3f}s")
 
         # Convert to list of action dicts
         n_actions = len(predicted_actions["buttons"])

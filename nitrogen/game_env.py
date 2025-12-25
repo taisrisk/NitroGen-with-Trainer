@@ -163,7 +163,7 @@ PS4_MAPPING = {
 
 
 class GamepadEmulator:
-    def __init__(self, controller_type="xbox", system="windows"):
+    def __init__(self, controller_type="xbox", system="windows", *, invert_y_axis: bool = False):
         """
         Initialize the GamepadEmulator with a specific controller type and system.
 
@@ -173,6 +173,7 @@ class GamepadEmulator:
         """
         self.controller_type = controller_type
         self.system = system
+        self.invert_y_axis = bool(invert_y_axis)
         self._create_gamepad()
 
         # Initialize joystick values to keep track of the current state
@@ -180,6 +181,8 @@ class GamepadEmulator:
         self.left_joystick_y: int = 0
         self.right_joystick_x: int = 0
         self.right_joystick_y: int = 0
+        self._consecutive_failures: int = 0
+        self._last_failure: str | None = None
 
     def _create_gamepad(self):
         if self.controller_type == "xbox":
@@ -205,6 +208,31 @@ class GamepadEmulator:
         self._create_gamepad()
         self.reset()
 
+    def _record_failure(self, where: str, exc: Exception | None = None) -> None:
+        self._consecutive_failures += 1
+        self._last_failure = where
+        if exc is not None:
+            print(f"[warn] controller {where} failed (n={self._consecutive_failures}): {exc!r}")
+        else:
+            print(f"[warn] controller {where} failed (n={self._consecutive_failures})")
+
+    def _clear_failures(self) -> None:
+        self._consecutive_failures = 0
+        self._last_failure = None
+
+    def _maybe_reconnect(self, where: str, exc: Exception) -> None:
+        self._record_failure(where, exc)
+        # Avoid destroying/recreating the virtual controller on the first transient error.
+        if self._consecutive_failures < 3:
+            return
+        print(f"[warn] controller reconnect (last_failure={self._last_failure!r})")
+        try:
+            self._create_gamepad()
+        except Exception as e:
+            # If we can't recreate the device, keep the existing one and surface the root error.
+            raise RuntimeError(f"Failed to recreate virtual controller after {where} failure ({e!r})") from exc
+        self._clear_failures()
+
     def step(self, action):
         """
         Perform actions based on the provided action dictionary.
@@ -215,9 +243,15 @@ class GamepadEmulator:
         """
         try:
             self.gamepad.reset()
-        except Exception:
-            self.reconnect()
-            self.gamepad.reset()
+        except Exception as e:
+            self._maybe_reconnect("reset", e)
+            # Retry once; if it still fails, then force a reconnect.
+            try:
+                self.gamepad.reset()
+            except Exception as e2:
+                self._record_failure("reset_retry", e2)
+                self.reconnect()
+                self.gamepad.reset()
 
         # Handle buttons
         for control in [
@@ -260,9 +294,18 @@ class GamepadEmulator:
 
         try:
             self.gamepad.update()
-        except Exception:
-            self.reconnect()
-            self.gamepad.update()
+            self._clear_failures()
+        except Exception as e:
+            self._maybe_reconnect("update", e)
+            # Retry once; if it still fails, then force a reconnect.
+            try:
+                self.gamepad.update()
+                self._clear_failures()
+            except Exception as e2:
+                self._record_failure("update_retry", e2)
+                self.reconnect()
+                self.gamepad.update()
+                self._clear_failures()
 
     def press_button(self, button):
         """
@@ -326,7 +369,7 @@ class GamepadEmulator:
             self.left_joystick_x = value
             self.gamepad.left_joystick(x_value=self.left_joystick_x, y_value=self.left_joystick_y)
         elif joystick == "AXIS_LEFTY":
-            if self.system == "windows":
+            if self.invert_y_axis:
                 value = -value - 1
             self.left_joystick_y = value
             self.gamepad.left_joystick(x_value=self.left_joystick_x, y_value=self.left_joystick_y)
@@ -336,7 +379,7 @@ class GamepadEmulator:
                 x_value=self.right_joystick_x, y_value=self.right_joystick_y
             )
         elif joystick == "AXIS_RIGHTY":
-            if self.system == "windows":
+            if self.invert_y_axis:
                 value = -value - 1
             self.right_joystick_y = value
             self.gamepad.right_joystick(
@@ -374,10 +417,20 @@ class GamepadEmulator:
         try:
             self.gamepad.reset()
             self.gamepad.update()
-        except Exception:
-            self.reconnect()
-            self.gamepad.reset()
-            self.gamepad.update()
+            self._clear_failures()
+        except Exception as e:
+            self._maybe_reconnect("reset_call", e)
+            # Retry once; if it still fails, then force a reconnect.
+            try:
+                self.gamepad.reset()
+                self.gamepad.update()
+                self._clear_failures()
+            except Exception as e2:
+                self._record_failure("reset_call_retry", e2)
+                self.reconnect()
+                self.gamepad.reset()
+                self.gamepad.update()
+                self._clear_failures()
 
 class PyautoguiScreenshotBackend:
 
@@ -432,6 +485,7 @@ class GamepadEnv(Env):
         image_height=1440,
         image_width=2560,
         controller_type="xbox",
+        enable_controller: bool = True,
         game_speed=1.0,
         env_fps=10,
         async_mode=True,
@@ -442,6 +496,7 @@ class GamepadEnv(Env):
         capture_retry_delay_s: float = 0.02,
         hard_fail_after: int = 5,
         hard_fail_sleep_s: float = 1.0,
+        invert_y_axis: bool = False,
     ):
         super().__init__()
 
@@ -467,7 +522,14 @@ class GamepadEnv(Env):
         self._consecutive_capture_failures = 0
         self._hard_fail_logged = False
 
-        self.gamepad_emulator = GamepadEmulator(controller_type=controller_type, system=os_name)
+        self.enable_controller = bool(enable_controller)
+        self.gamepad_emulator = None
+        if self.enable_controller:
+            self.gamepad_emulator = GamepadEmulator(
+                controller_type=controller_type,
+                system=os_name,
+                invert_y_axis=bool(invert_y_axis),
+            )
         proc_info = get_process_info(game)
 
         self.game_pid = proc_info["pid"]
@@ -594,7 +656,8 @@ class GamepadEnv(Env):
                     win32gui.SetForegroundWindow(self.game_hwnd)
                 except Exception:
                     pass
-        self.gamepad_emulator.step(action)
+        if self.gamepad_emulator is not None:
+            self.gamepad_emulator.step(action)
         start = time.perf_counter()
         self.unpause()
         # Wait until the next step
@@ -646,8 +709,9 @@ class GamepadEnv(Env):
                 win32gui.SetForegroundWindow(self.game_hwnd)
             except Exception:
                 pass
-        self.gamepad_emulator.wakeup(duration=0.1)
-        time.sleep(1.0)
+        if self.gamepad_emulator is not None:
+            self.gamepad_emulator.wakeup(duration=0.1)
+            time.sleep(1.0)
 
     def close(self):
         """

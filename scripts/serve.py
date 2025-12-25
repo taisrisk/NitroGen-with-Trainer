@@ -115,6 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("--gc-collect-every", type=int, default=10, help="Run gc.collect() every N predictions (0 disables)")
     parser.add_argument("--cuda-empty-cache-every", type=int, default=0, help="Run torch.cuda.empty_cache() every N predictions (0 disables)")
     parser.add_argument("--gc-log", action="store_true", help="Log GC pause durations")
+    parser.add_argument("--debug", action="store_true", help="Print per-request timing + command_id (for play.py sync)")
     args = parser.parse_args()
 
     print(f"[env] python={sys.executable}")
@@ -144,7 +145,24 @@ if __name__ == "__main__":
         device=args.device,
         amp_dtype=amp_dtype,
         weights_dtype=weights_dtype,
+        debug=args.debug,
     )
+    # This project now serves keyboard action-space models only.
+    try:
+        info0 = session.info()
+        if str(info0.get("action_space") or "").strip().lower() != "keyboard":
+            raise SystemExit(
+                f"[error] This server only supports keyboard action-space checkpoints. "
+                f"Got action_space={info0.get('action_space')!r}. "
+                f"Serve a keyboard checkpoint directly (e.g. `python scripts/serve.py gow_kbm.pt`)."
+            )
+    except SystemExit:
+        raise
+    except Exception:
+        raise SystemExit(
+            "[error] This server only supports keyboard action-space checkpoints. "
+            "Your checkpoint is missing `action_space`/`button_names` metadata; re-train with the updated scripts/train.py."
+        )
     if args.steps is not None and hasattr(session.model, "num_inference_timesteps"):
         session.model.num_inference_timesteps = int(args.steps)
 
@@ -216,6 +234,7 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     predict_count = 0
+    command_id = 0
 
     try:
         while True:
@@ -243,13 +262,29 @@ if __name__ == "__main__":
                         response = {"status": "error", "message": f"info failed: {e!r}"}
                 elif request["type"] == "predict":
                     try:
+                        t_recv = time.time()
                         raw_image = request["image"]
+                        command_id += 1
                         result = session.predict(raw_image)
+                        t_done = time.time()
                         response = {
                             "status": "ok",
-                            "pred": result
+                            "pred": result,
+                            "meta": {
+                                "command_id": int(command_id),
+                                "server_recv_time_s": float(t_recv),
+                                "server_send_time_s": float(time.time()),
+                                "server_infer_time_s": float(t_done - t_recv),
+                            },
                         }
                         predict_count += 1
+                        if args.debug:
+                            ts = time.strftime("%H:%M:%S")
+                            meta = response["meta"]
+                            print(
+                                f"[{ts}] [cmd {meta['command_id']}] infer={meta['server_infer_time_s']:.3f}s "
+                                f"recv={meta['server_recv_time_s']:.6f} send={meta['server_send_time_s']:.6f}"
+                            )
                         run_gc = args.gc_collect_every > 0 and (predict_count % args.gc_collect_every == 0)
                         run_cuda_cache = args.cuda_empty_cache_every > 0 and (predict_count % args.cuda_empty_cache_every == 0)
                         if run_gc or run_cuda_cache:

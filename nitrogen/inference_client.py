@@ -131,8 +131,13 @@ class ModelClient:
         
         if response["status"] != "ok":
             raise RuntimeError(f"Server error: {response.get('message', 'Unknown error')}")
-        
-        return response["pred"]
+
+        pred = response.get("pred") or {}
+        if isinstance(pred, dict):
+            meta = response.get("meta")
+            if isinstance(meta, dict):
+                pred["_meta"] = meta
+        return pred
     
     def reset(self):
         """Reset the server's session (clear buffers)."""
