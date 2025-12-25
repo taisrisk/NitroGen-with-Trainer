@@ -83,6 +83,22 @@ def _cuda_device_index(device: str) -> int | None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Model inference server")
     parser.add_argument("ckpt", type=str, help="Path to checkpoint file")
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional weights file to load on top of the base checkpoint's config/model definition. "
+            "Supports dicts with keys like 'model' (train checkpoint) or 'model_state' (cache), "
+            "or a raw state_dict."
+        ),
+    )
+    parser.add_argument(
+        "--weights-strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use strict state_dict loading when --weights is provided.",
+    )
     parser.add_argument("--port", type=int, default=5555, help="Port to serve on")
     parser.add_argument("--old-layout", action="store_true", help="Use old layout")
     parser.add_argument("--cfg", type=float, default=1.0, help="CFG scale")
@@ -120,6 +136,8 @@ if __name__ == "__main__":
 
     session = InferenceSession.from_ckpt(
         args.ckpt,
+        weights_path=args.weights,
+        weights_strict=args.weights_strict,
         old_layout=args.old_layout,
         cfg_scale=args.cfg,
         context_length=args.ctx,
@@ -172,7 +190,21 @@ if __name__ == "__main__":
     # Setup ZeroMQ
     context = zmq.Context()
     socket = context.socket(zmq.REP)
-    socket.bind(f"tcp://*:{args.port}")
+    try:
+        socket.bind(f"tcp://*:{args.port}")
+    except zmq.error.ZMQError as e:
+        if getattr(e, "errno", None) is not None:
+            # Common on Windows when another server instance is still listening.
+            print(f"[error] Failed to bind tcp://*:{args.port} (errno={e.errno}): {e}")
+        else:
+            print(f"[error] Failed to bind tcp://*:{args.port}: {e}")
+        print(
+            f"Port {args.port} is likely already in use.\n"
+            f"- Pick a different port: `--port 5556` (and pass the same `--port` to scripts/play.py)\n"
+            f"- Or free the port in PowerShell:\n"
+            f"  `$pid=(Get-NetTCPConnection -LocalPort {args.port} -State Listen).OwningProcess; Stop-Process -Id $pid -Force`"
+        )
+        raise SystemExit(1)
 
     # Create poller
     poller = zmq.Poller()
