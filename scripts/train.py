@@ -216,11 +216,19 @@ def _safe_action_col_by_index(action_seq: np.ndarray, idx: int) -> np.ndarray:
     return np.zeros((action_seq.shape[0],), dtype=np.float32)
 
 
-def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None) -> np.ndarray:
+def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None, *, profile: str = "gow") -> np.ndarray:
     """
     Map converter action layout (usually 20D or 25D, names like 'space', 'ctrl', 'lmb')
     into NitroGen button tensor aligned with BUTTON_ACTION_TOKENS.
     """
+    return map_buttons_profile(action_seq, action_names=action_names, profile=profile)
+
+
+def map_buttons_profile(action_seq: np.ndarray, action_names: list[str] | None = None, *, profile: str) -> np.ndarray:
+    profile = str(profile or "").strip().lower()
+    if profile not in {"gow", "fps"}:
+        raise ValueError(f"Unknown control profile {profile!r} (expected 'gow' or 'fps').")
+
     btn = np.zeros((action_seq.shape[0], len(BUTTON_ACTION_TOKENS)), dtype=np.float32)
     idx = {name: BUTTON_ACTION_TOKENS.index(name) for name in BUTTON_ACTION_TOKENS}
 
@@ -235,28 +243,73 @@ def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None) -
             return np.zeros((action_seq.shape[0],), dtype=np.float32)
         return _safe_action_col_by_index(action_seq, fallback_idx)
 
-    # Shoulders/triggers/thumbs
-    btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)
-    # Mouse buttons map to controller triggers (FPS-style):
-    # - RMB (aim)  -> LEFT_TRIGGER
-    # - LMB (fire) -> RIGHT_TRIGGER
-    btn[:, idx["LEFT_TRIGGER"]] = col("rmb", fallback_idx=9)
-    btn[:, idx["LEFT_THUMB"]] = col("f", fallback_idx=12)
-    btn[:, idx["RIGHT_SHOULDER"]] = col("r", fallback_idx=11)
-    btn[:, idx["RIGHT_TRIGGER"]] = col("lmb", fallback_idx=8)
-    btn[:, idx["RIGHT_THUMB"]] = col("g", fallback_idx=13)
+    if profile == "gow":
+        # God of War Ragnarök (PC keyboard/mouse -> Xbox controller layout)
+        # Ground-truth mapping (from your description):
+        # - Light attack: LMB  (holdable) -> R1
+        # - Heavy attack: RMB  (holdable) -> R2
+        # - Run: Shift (hold) -> L3
+        # - Aim: Ctrl (hold)  -> L2
+        # - Special ability: Q + (LMB/RMB) -> L1+R1 / L1+R2 (Runic attacks)
+        # - Power up weapon: R (hold) -> Y
+        # - Weapons: 1/2/3 -> D-pad (tunable)
+        #
+        # Notes:
+        # - Movement/camera handled via sticks (WASD + mouse deltas) elsewhere.
+        # - Using Q as L1 means Q+click automatically becomes L1+R1/L1+R2.
+        btn[:, idx["RIGHT_SHOULDER"]] = col("lmb", fallback_idx=8)  # R1 light
+        btn[:, idx["RIGHT_TRIGGER"]] = col("rmb", fallback_idx=9)  # R2 heavy
+        btn[:, idx["LEFT_TRIGGER"]] = col("ctrl", fallback_idx=5)  # L2 aim
+        btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)  # L1 (runic modifier)
+        btn[:, idx["LEFT_THUMB"]] = col("shift", fallback_idx=6)  # L3 run
 
-    # Face/buttons
-    btn[:, idx["SOUTH"]] = col("space", fallback_idx=4)
-    btn[:, idx["WEST"]] = col("x", fallback_idx=20)
-    btn[:, idx["EAST"]] = col("ctrl", fallback_idx=5)
-    btn[:, idx["NORTH"]] = col("e", fallback_idx=7)
-    btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
-    btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
+        # Interact / confirm: E (interact) and Enter (confirm)
+        btn[:, idx["SOUTH"]] = np.maximum(col("e", fallback_idx=7), col("enter", fallback_idx=22))  # A
 
-    # System/menu
-    btn[:, idx["BACK"]] = col("esc", "escape", fallback_idx=23)
-    btn[:, idx["START"]] = col("enter", "return", fallback_idx=22)
+        # Menu / pause
+        btn[:, idx["START"]] = col("esc", "escape", fallback_idx=23)
+
+        # Power up weapon: R (hold)
+        btn[:, idx["NORTH"]] = col("r", fallback_idx=11)  # Y
+
+        # Weapon select (can adjust later if you want different D-pad directions)
+        btn[:, idx["DPAD_LEFT"]] = col("1", fallback_idx=16)
+        btn[:, idx["DPAD_RIGHT"]] = col("2", fallback_idx=17)
+        btn[:, idx["DPAD_DOWN"]] = col("3", fallback_idx=18)
+
+        # "Ghost" bindings for now (tokens not consumed by GamepadEmulator.step)
+        btn[:, idx["RIGHT_LEFT"]] = col("g", fallback_idx=13)
+        btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
+        btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
+        btn[:, idx["RIGHT_RIGHT"]] = col("f", fallback_idx=12)
+        btn[:, idx["RIGHT_LEFT"]] = np.maximum(btn[:, idx["RIGHT_LEFT"]], col("x", fallback_idx=20))
+        btn[:, idx["RIGHT_RIGHT"]] = np.maximum(btn[:, idx["RIGHT_RIGHT"]], col("z", fallback_idx=21))
+        btn[:, idx["RIGHT_UP"]] = np.maximum(btn[:, idx["RIGHT_UP"]], col("i", fallback_idx=24))
+    else:
+        # FPS-style baseline (useful for shooters):
+        # - L2 aim: RMB
+        # - R2 fire: LMB
+        # - R1: R
+        # - L1: Q
+        # - A: Space
+        btn[:, idx["LEFT_TRIGGER"]] = col("rmb", fallback_idx=9)
+        btn[:, idx["RIGHT_TRIGGER"]] = col("lmb", fallback_idx=8)
+        btn[:, idx["RIGHT_SHOULDER"]] = col("r", fallback_idx=11)
+        btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)
+        btn[:, idx["LEFT_THUMB"]] = col("f", fallback_idx=12)
+        btn[:, idx["RIGHT_THUMB"]] = col("g", fallback_idx=13)
+
+        btn[:, idx["SOUTH"]] = col("space", fallback_idx=4)
+        btn[:, idx["WEST"]] = col("x", fallback_idx=20)
+        btn[:, idx["EAST"]] = col("ctrl", fallback_idx=5)
+        btn[:, idx["NORTH"]] = col("e", fallback_idx=7)
+        btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
+        btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
+
+    # System/menu (leave on the baseline profile)
+    if profile != "gow":
+        btn[:, idx["BACK"]] = col("esc", "escape", fallback_idx=23)
+        btn[:, idx["START"]] = col("enter", "return", fallback_idx=22)
     return btn
 
 
@@ -273,6 +326,7 @@ class NitroGenDataset(Dataset):
         action_horizon: int,
         context_frames: int = 1,
         frame_spacing: int = 1,
+        control_profile: str = "gow",
         expected_action_dim: int | None = 25,
         game: str | None = None,
         tokenizer: NitrogenTokenizer | None = None,
@@ -297,12 +351,15 @@ class NitroGenDataset(Dataset):
         self.tokenizer = tokenizer
         self.context_frames = int(context_frames)
         self.frame_spacing = int(frame_spacing)
+        self.control_profile = str(control_profile or "").strip().lower()
         self._encoded: list[dict] | None = None
 
         if self.context_frames < 1:
             raise ValueError(f"context_frames must be >= 1, got {self.context_frames}")
         if self.frame_spacing < 1:
             raise ValueError(f"frame_spacing must be >= 1, got {self.frame_spacing}")
+        if self.control_profile not in {"gow", "fps"}:
+            raise ValueError(f"Unknown control_profile {self.control_profile!r} (expected 'gow' or 'fps').")
 
         if self.actions.ndim != 3:
             raise ValueError(f"Expected actions shape (N, T, A), got {self.actions.shape}")
@@ -412,7 +469,7 @@ class NitroGenDataset(Dataset):
         pixel_values = self.image_processor(frames_hwc, return_tensors="pt")["pixel_values"]
 
         action_seq = self.actions[idx].astype(np.float32)
-        buttons = torch.from_numpy(map_buttons(action_seq, self.action_names)).unsqueeze(0)
+        buttons = torch.from_numpy(map_buttons(action_seq, self.action_names, profile=self.control_profile)).unsqueeze(0)
 
         # Joystick axes come from the converter layout; prefer name-based extraction when available.
         if self.action_names is not None:
@@ -541,6 +598,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override ckpt_config.modality_cfg.frame_spacing (dataset index step between context frames)",
     )
+    p.add_argument(
+        "--control-profile",
+        choices=("gow", "fps"),
+        default="gow",
+        help="How to map recorded keyboard/mouse buttons into controller buttons/triggers (default: gow).",
+    )
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -646,6 +709,7 @@ def main() -> None:
         action_horizon=model_horizon,
         context_frames=getattr(cfg.modality_cfg, "frame_per_sample", 1),
         frame_spacing=getattr(cfg.modality_cfg, "frame_spacing", 1) or 1,
+        control_profile=str(args.control_profile),
         expected_action_dim=getattr(cfg.model_cfg, "action_dim", 25),
         game=args.game,
         tokenizer=tokenizer if args.preencode else None,
