@@ -173,20 +173,37 @@ class GamepadEmulator:
         """
         self.controller_type = controller_type
         self.system = system
-        if controller_type == "xbox":
-            self.gamepad = vg.VX360Gamepad()
-            self.mapping = XBOX_MAPPING
-        elif controller_type == "ps4":
-            self.gamepad = vg.VDS4Gamepad()
-            self.mapping = PS4_MAPPING
-        else:
-            raise ValueError("Unsupported controller type")
+        self._create_gamepad()
 
         # Initialize joystick values to keep track of the current state
         self.left_joystick_x: int = 0
         self.left_joystick_y: int = 0
         self.right_joystick_x: int = 0
         self.right_joystick_y: int = 0
+
+    def _create_gamepad(self):
+        if self.controller_type == "xbox":
+            try:
+                self.gamepad = vg.VX360Gamepad()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create VX360Gamepad (ViGEm). Is ViGEmBus installed? ({e!r})"
+                ) from e
+            self.mapping = XBOX_MAPPING
+        elif self.controller_type == "ps4":
+            try:
+                self.gamepad = vg.VDS4Gamepad()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create VDS4Gamepad (ViGEm). Is ViGEmBus installed? ({e!r})"
+                ) from e
+            self.mapping = PS4_MAPPING
+        else:
+            raise ValueError("Unsupported controller type")
+
+    def reconnect(self):
+        self._create_gamepad()
+        self.reset()
 
     def step(self, action):
         """
@@ -196,7 +213,11 @@ class GamepadEmulator:
         action (dict): Dictionary of an action to be performed. Keys are control names,
                        and values are their respective states.
         """
-        self.gamepad.reset()
+        try:
+            self.gamepad.reset()
+        except Exception:
+            self.reconnect()
+            self.gamepad.reset()
 
         # Handle buttons
         for control in [
@@ -237,7 +258,11 @@ class GamepadEmulator:
             self.set_joystick("AXIS_RIGHTX", action["AXIS_RIGHTX"][0])
             self.set_joystick("AXIS_RIGHTY", action["AXIS_RIGHTY"][0])
 
-        self.gamepad.update()
+        try:
+            self.gamepad.update()
+        except Exception:
+            self.reconnect()
+            self.gamepad.update()
 
     def press_button(self, button):
         """
@@ -278,6 +303,7 @@ class GamepadEmulator:
         value (float): The value to set the trigger to (between 0 and 1).
         """
         value = int(value)
+        value = max(0, min(255, value))
         trigger_mapped = self.mapping.get(trigger)
         if trigger_mapped == "LEFT_TRIGGER":
             self.gamepad.left_trigger(value=value)
@@ -294,6 +320,8 @@ class GamepadEmulator:
         joystick (str): The name of the joystick axis.
         value (float): The value to set the joystick axis to (between -32768 and 32767)
         """
+        value = int(value)
+        value = max(-32768, min(32767, value))
         if joystick == "AXIS_LEFTX":
             self.left_joystick_x = value
             self.gamepad.left_joystick(x_value=self.left_joystick_x, y_value=self.left_joystick_y)
@@ -324,19 +352,32 @@ class GamepadEmulator:
         Parameters:
         duration (float): Duration to press the button.
         """
-        self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB)
-        self.gamepad.update()
-        time.sleep(duration)
-        self.gamepad.reset()
-        self.gamepad.update()
-        time.sleep(duration)
+        try:
+            self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
+            self.gamepad.update()
+            time.sleep(duration)
+            self.gamepad.reset()
+            self.gamepad.update()
+            time.sleep(duration)
+        except Exception:
+            self.gamepad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB)
+            self.gamepad.update()
+            time.sleep(duration)
+            self.gamepad.reset()
+            self.gamepad.update()
+            time.sleep(duration)
 
     def reset(self):
         """
         Reset the gamepad to its default state.
         """
-        self.gamepad.reset()
-        self.gamepad.update()
+        try:
+            self.gamepad.reset()
+            self.gamepad.update()
+        except Exception:
+            self.reconnect()
+            self.gamepad.reset()
+            self.gamepad.update()
 
 class PyautoguiScreenshotBackend:
 
@@ -347,20 +388,25 @@ class PyautoguiScreenshotBackend:
         return pyautogui.screenshot(region=self.bbox)
 
 class DxcamScreenshotBackend:
-    def __init__(self, bbox):
+    def __init__(self, bbox, reuse_last_on_fail: bool = True):
         import dxcam
-        self.camera = dxcam.create()
+        try:
+            self.camera = dxcam.create(output_idx=0, output_color="RGB", max_buffer_len=1)
+        except TypeError:
+            try:
+                self.camera = dxcam.create(output_idx=0, output_color="RGB")
+            except TypeError:
+                self.camera = dxcam.create()
         self.bbox = bbox
         self.last_screenshot = None
+        self.reuse_last_on_fail = bool(reuse_last_on_fail)
 
     def screenshot(self):
         screenshot = self.camera.grab(region=self.bbox)
         if screenshot is None:
-            print("DXCAM failed to capture frame, trying to use the latest screenshot")
-            if self.last_screenshot is not None:
+            if self.reuse_last_on_fail and self.last_screenshot is not None:
                 return self.last_screenshot
-            else:
-                return Image.new("RGB", (self.bbox[2], self.bbox[3]), (0, 0, 0))
+            return None
         screenshot = Image.fromarray(screenshot)
         self.last_screenshot = screenshot
         return screenshot
@@ -390,6 +436,12 @@ class GamepadEnv(Env):
         env_fps=10,
         async_mode=True,
         screenshot_backend="dxcam",
+        focus_each_step: bool = False,
+        capture_margin: int = 0,
+        reuse_last_frame_on_capture_fail: bool = True,
+        capture_retry_delay_s: float = 0.02,
+        hard_fail_after: int = 5,
+        hard_fail_sleep_s: float = 1.0,
     ):
         super().__init__()
 
@@ -406,6 +458,14 @@ class GamepadEnv(Env):
         self.env_fps = env_fps
         self.step_duration = self.calculate_step_duration()
         self.async_mode = async_mode
+        self.focus_each_step = bool(focus_each_step)
+        self.capture_margin = int(capture_margin)
+        self.reuse_last_frame_on_capture_fail = bool(reuse_last_frame_on_capture_fail)
+        self.capture_retry_delay_s = float(capture_retry_delay_s)
+        self.hard_fail_after = int(hard_fail_after)
+        self.hard_fail_sleep_s = float(hard_fail_sleep_s)
+        self._consecutive_capture_failures = 0
+        self._hard_fail_logged = False
 
         self.gamepad_emulator = GamepadEmulator(controller_type=controller_type, system=os_name)
         proc_info = get_process_info(game)
@@ -462,16 +522,24 @@ class GamepadEnv(Env):
         if not self.game_window:
             raise Exception(f"No window found with game name: {self.game}")
 
+        self.game_hwnd = getattr(self.game_window, "_hWnd", None)
+
         self.game_window.activate()
         l, t, r, b = self.game_window.left, self.game_window.top, self.game_window.right, self.game_window.bottom
-        self.bbox = (l, t, r-l, b-t)
+        m = max(0, self.capture_margin)
+        w = max(1, (r - l) - 2 * m)
+        h = max(1, (b - t) - 2 * m)
+        self.bbox = (l + m, t + m, w, h)
 
         # Initialize speedhack client if using DLL injection
-        self.speedhack_client = xsh.Client(process_id=self.game_pid, arch=self.game_arch)
+        self.speedhack_client = None
 
         # Get the screenshot backend
         if screenshot_backend == "dxcam":
-            self.screenshot_backend = DxcamScreenshotBackend(self.bbox)
+            self.screenshot_backend = DxcamScreenshotBackend(
+                self.bbox,
+                reuse_last_on_fail=self.reuse_last_frame_on_capture_fail,
+            )
         elif screenshot_backend == "pyautogui":
             self.screenshot_backend = PyautoguiScreenshotBackend(self.bbox)
         else:
@@ -491,17 +559,21 @@ class GamepadEnv(Env):
         """
         return 1.0 / (self.env_fps * self.game_speed)
 
-    def unpause(self):
-        """
-        Unpause the game using the specified method.
-        """
-        self.speedhack_client.set_speed(1.0)
-
     def pause(self):
         """
         Pause the game using the specified method.
         """
-        self.speedhack_client.set_speed(0.0)
+        if self.speedhack_client is not None:
+            self.speedhack_client.set_speed(0.0)
+
+    def unpause(self):
+        """
+        Unpause the game using the specified method.
+        """
+        if self.speedhack_client is not None:
+            self.speedhack_client.set_speed(1.0)
+
+
 
     def perform_action(self, action, duration):
         """
@@ -511,14 +583,23 @@ class GamepadEnv(Env):
         action (dict): Action to be performed.
         duration (float): Duration for the action step.
         """
+        if self.focus_each_step:
+            try:
+                self.game_window.activate()
+            except Exception:
+                pass
+            if self.game_hwnd is not None:
+                try:
+                    win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                    win32gui.SetForegroundWindow(self.game_hwnd)
+                except Exception:
+                    pass
         self.gamepad_emulator.step(action)
         start = time.perf_counter()
         self.unpause()
         # Wait until the next step
-        end = start + self.step_duration
-        now = time.perf_counter()
-        while now < end:
-            now = time.perf_counter()
+        end = start + duration
+        time.sleep(max(0.0, end - time.perf_counter()))
         self.pause()
 
     def step(self, action, step_duration=None):
@@ -555,6 +636,16 @@ class GamepadEnv(Env):
         seed (int, optional): Random seed.
         options (dict, optional): Additional options for reset.
         """
+        try:
+            self.game_window.activate()
+        except Exception:
+            pass
+        if getattr(self, "game_hwnd", None) is not None:
+            try:
+                win32gui.ShowWindow(self.game_hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(self.game_hwnd)
+            except Exception:
+                pass
         self.gamepad_emulator.wakeup(duration=0.1)
         time.sleep(1.0)
 
@@ -571,7 +662,29 @@ class GamepadEnv(Env):
         Returns:
         Image: Observation of the game environment.
         """
-        screenshot = self.screenshot_backend.screenshot()
+        while True:
+            screenshot = self.screenshot_backend.screenshot()
+            if screenshot is not None:
+                self._consecutive_capture_failures = 0
+                self._hard_fail_logged = False
+                break
+
+            self._consecutive_capture_failures += 1
+            if self._consecutive_capture_failures >= self.hard_fail_after and not self._hard_fail_logged:
+                print(
+                    "\n!!! DXCAM HARD-FAIL: capture repeatedly failing; pausing actions until capture recovers !!!\n"
+                    "If this persists:\n"
+                    "- Switch the game to borderless/windowed mode (exclusive fullscreen often breaks Desktop Duplication).\n"
+                    "- Try `scripts/play.py --screenshot-backend pyautogui`.\n"
+                    "- Try increasing `--capture-margin` (some games have invisible borders/overlays).\n"
+                )
+                self._hard_fail_logged = True
+
+            print(f"DXCAM failed to capture frame ({self._consecutive_capture_failures}x); retrying...")
+            time.sleep(self.capture_retry_delay_s)
+            if self._consecutive_capture_failures >= self.hard_fail_after:
+                time.sleep(self.hard_fail_sleep_s)
+
         screenshot = screenshot.resize((self.image_width, self.image_height))
 
         return screenshot

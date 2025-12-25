@@ -89,6 +89,7 @@ class NitrogenTokenizerConfig(BaseModel):
     max_sequence_length: int = Field(default=300, description="Maximum sequence length.")
     action_horizon: int = Field(default=16, description="Action horizon.")
     game_mapping_cfg: GameMappingConfig | None = Field(default=None, description="Game mapping configuration.")
+    use_action_mask: bool = Field(default=True, description="Whether to include actions_mask in the tokenized output.")
     old_layout: bool = Field(default=False, description="Whether to use the old layout for actions. If True, the action layout is [buttons, j_left, j_right]. If False, it is [j_left, j_right, buttons].")
 
 class NitrogenTokenizer(Tokenizer):
@@ -323,10 +324,35 @@ class NitrogenTokenizer(Tokenizer):
         return transformed_data
 
     def decode(self, data: dict) -> dict:
-        j_left, j_right, buttons = self.unpack_actions(data["action_tensor"])
-        
+        actions = data["action_tensor"]
+
+        # Unpack the actions into (buttons, sticks). Buttons include digital buttons and
+        # analog triggers (LEFT_TRIGGER/RIGHT_TRIGGER), matching BUTTON_ACTION_TOKENS.
+        if self.old_layout:
+            j_left_u = actions[:, :, :2]
+            j_right_u = actions[:, :, 2:4]
+            buttons_raw = actions[:, :, 4:]
+        else:
+            buttons_raw = actions[:, :, :-4]
+            j_left_u = actions[:, :, -4:-2]
+            j_right_u = actions[:, :, -2:]
+
+        # Denormalize the joysticks back to [-1, 1].
+        j_left_raw = j_left_u * 2.0 - 1.0
+        j_right_raw = j_right_u * 2.0 - 1.0
+
+        # Clip sticks into valid range (the env expects [-1, 1]).
+        j_left = torch.clamp(j_left_raw, -1, 1)
+        j_right = torch.clamp(j_right_raw, -1, 1)
+
+        # Binarize buttons for the env; keep raw scores for debugging/trace.
+        buttons = (buttons_raw > 0.5).float()
+
         return {
             "j_left": j_left,
             "j_right": j_right,
             "buttons": buttons,
+            "buttons_raw": buttons_raw,
+            "j_left_raw": j_left_raw,
+            "j_right_raw": j_right_raw,
         }
