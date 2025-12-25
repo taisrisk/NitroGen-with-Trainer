@@ -237,16 +237,19 @@ def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None) -
 
     # Shoulders/triggers/thumbs
     btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)
-    btn[:, idx["LEFT_TRIGGER"]] = col("ctrl", fallback_idx=5)
+    # Mouse buttons map to controller triggers (FPS-style):
+    # - RMB (aim)  -> LEFT_TRIGGER
+    # - LMB (fire) -> RIGHT_TRIGGER
+    btn[:, idx["LEFT_TRIGGER"]] = col("rmb", fallback_idx=9)
     btn[:, idx["LEFT_THUMB"]] = col("f", fallback_idx=12)
     btn[:, idx["RIGHT_SHOULDER"]] = col("r", fallback_idx=11)
-    btn[:, idx["RIGHT_TRIGGER"]] = np.maximum(col("shift", fallback_idx=6), col("3", fallback_idx=18))
+    btn[:, idx["RIGHT_TRIGGER"]] = col("lmb", fallback_idx=8)
     btn[:, idx["RIGHT_THUMB"]] = col("g", fallback_idx=13)
 
     # Face/buttons
     btn[:, idx["SOUTH"]] = col("space", fallback_idx=4)
-    btn[:, idx["WEST"]] = np.maximum(col("lmb", fallback_idx=8), col("x", fallback_idx=20))
-    btn[:, idx["EAST"]] = col("rmb", fallback_idx=9)
+    btn[:, idx["WEST"]] = col("x", fallback_idx=20)
+    btn[:, idx["EAST"]] = col("ctrl", fallback_idx=5)
     btn[:, idx["NORTH"]] = col("e", fallback_idx=7)
     btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
     btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
@@ -468,10 +471,6 @@ def load_base_ckpt(path: Path, *, debug: bool = False) -> Tuple[NitroGen, Nitrog
     base_step = int(ckpt.get("step", 0) or 0)
     base_epoch = int(ckpt.get("epoch", 0) or 0)
 
-    # Force action history usage if available in the modality config.
-    if hasattr(cfg, "modality_cfg") and getattr(cfg.modality_cfg, "action_interleaving", None) is not None:
-        cfg.modality_cfg.action_interleaving = True
-
     cfg.tokenizer_cfg.training = True
     tokenizer = NitrogenTokenizer(cfg.tokenizer_cfg)
     game_mapping = tokenizer.game_mapping
@@ -604,6 +603,30 @@ def main() -> None:
         cfg = cfg.model_copy(update={"modality_cfg": cfg.modality_cfg.model_copy(update=modality_update)}, deep=True)
     tokenizer.train()
     model.to(device).train()
+
+    # If using more than 1 context frame, expand tokenizer max_sequence_length if possible.
+    try:
+        ctx_frames = int(getattr(cfg.modality_cfg, "frame_per_sample", 1) or 1)
+    except Exception:
+        ctx_frames = 1
+    if ctx_frames > 1:
+        tokens_per_frame = int(getattr(cfg.tokenizer_cfg, "num_visual_tokens_per_frame", 0) or 0)
+        needs_game_token = bool(getattr(tokenizer, "game_mapping", None))
+        required = ctx_frames * tokens_per_frame + (1 if needs_game_token else 0)
+        try:
+            vl_limit = int(cfg.model_cfg.vl_self_attention_cfg.max_num_positional_embeddings)
+        except Exception:
+            vl_limit = None
+        if vl_limit is not None and required > vl_limit:
+            raise ValueError(
+                f"context_frames={ctx_frames} requires tokenizer.max_sequence_length >= {required}, "
+                f"but model supports only {vl_limit} positional embeddings."
+            )
+        current = int(getattr(cfg.tokenizer_cfg, "max_sequence_length", 0) or 0)
+        if required > current:
+            cfg.tokenizer_cfg.max_sequence_length = required
+            tokenizer.max_sequence_length = required
+            print(f"[{_ts()}] [info] tokenizer.max_sequence_length: {current} -> {required} (context_frames={ctx_frames})")
 
     model_horizon = cfg.model_cfg.action_horizon
     if hasattr(cfg, "modality_cfg"):
@@ -881,27 +904,15 @@ def main() -> None:
                 safe_save_cache(cache_state, cache_path)
 
         cfg_to_save = cfg.model_copy(deep=True)
-        cfg_to_save.tokenizer_cfg.training = False  # store inference-ready config
         args.out.parent.mkdir(parents=True, exist_ok=True)
         finetune_epoch = int(epoch + 1)
         total_epoch = int(base_epoch + finetune_epoch)
         total_step = int(base_step + opt_step)
         payload = {
             "model": model.state_dict(),
-            # Keep legacy top-level fields meaningful: total progress (base + finetune).
             "step": total_step,
             "epoch": total_epoch,
             "ckpt_config": cfg_to_save.model_dump(),
-            # Extra metadata for clarity/debugging.
-            "finetune": {
-                "epoch": finetune_epoch,
-                "global_step": int(global_step),
-                "opt_step": int(opt_step),
-                "grad_accum": int(args.grad_accum),
-                "steps_per_epoch": int(steps_per_epoch),
-                "base_step": int(base_step),
-                "base_epoch": int(base_epoch),
-            },
         }
         _atomic_torch_save(payload, args.out)
         print(f"[+] Epoch {epoch+1} finished. Saved checkpoint to {args.out} (epoch={total_epoch} step={total_step})")
