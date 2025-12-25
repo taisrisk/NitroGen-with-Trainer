@@ -3,7 +3,7 @@ Fine-tune a NitroGen checkpoint on a convert_to_nitrogen.py dataset.
 
 Dataset keys:
 - obs: (N, 3, H, W) float in [0,1]
-- actions: (N, T, 20) float, T == model action_horizon
+- actions: (N, T, 25) float (converter layout), and T == model action_horizon (ng.pt uses T=18)
 
 Credits:
 - zrorisc
@@ -37,30 +37,223 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-def map_buttons(a25: np.ndarray) -> np.ndarray:
-    """Map converter 25-D layout to NitroGen button tensor."""
-    btn = np.zeros((a25.shape[0], len(BUTTON_ACTION_TOKENS)), dtype=np.float32)
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def _norm_path(p: Path | str) -> str:
+    try:
+        return os.path.normcase(str(Path(p).expanduser().resolve()))
+    except Exception:
+        return os.path.normcase(os.path.abspath(os.fspath(p)))
+
+
+def _paths_equivalent(a: Path | str | None, b: Path | str | None) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        pa = Path(a).expanduser().resolve()
+        pb = Path(b).expanduser().resolve()
+        if pa.exists() and pb.exists():
+            try:
+                return pa.samefile(pb)
+            except Exception:
+                pass
+        return _norm_path(pa) == _norm_path(pb)
+    except Exception:
+        return _norm_path(os.fspath(a)) == _norm_path(os.fspath(b))
+
+
+def _file_fingerprint(path: Path) -> dict:
+    fp = {"path": str(path), "path_norm": _norm_path(path)}
+    try:
+        st = path.stat()
+        fp["size"] = int(st.st_size)
+        fp["mtime_ns"] = int(st.st_mtime_ns)
+    except Exception:
+        pass
+    return fp
+
+
+def _tokenizer_fingerprint(tokenizer: NitrogenTokenizer | None) -> dict:
+    if tokenizer is None:
+        return {}
+    return {
+        "action_horizon": getattr(tokenizer, "action_horizon", None),
+        "max_action_dim": getattr(tokenizer, "max_action_dim", None),
+        "max_sequence_length": getattr(tokenizer, "max_sequence_length", None),
+        "num_visual_tokens_per_frame": getattr(tokenizer, "num_visual_tokens_per_frame", None),
+        "old_layout": getattr(tokenizer, "old_layout", None),
+        "has_game_mapping": bool(getattr(tokenizer, "game_mapping", None)),
+        "game_mapping_size": len(getattr(tokenizer, "game_mapping", {}) or {}),
+    }
+
+
+def _atomic_torch_save(obj: object, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp_path)
+    tmp_path.replace(path)
+
+
+def _preencode_cache_matches(
+    cached: object,
+    *,
+    data_path: Path,
+    tokenizer: NitrogenTokenizer | None,
+    context_frames: int,
+    frame_spacing: int,
+) -> bool:
+    if not isinstance(cached, dict):
+        return False
+
+    # Prefer new-style fingerprinted cache if present.
+    dataset_meta = cached.get("dataset")
+    if isinstance(dataset_meta, dict):
+        cached_norm = dataset_meta.get("path_norm")
+        if cached_norm and cached_norm != _norm_path(data_path):
+            return False
+        try:
+            st = data_path.stat()
+            if dataset_meta.get("size") is not None and int(dataset_meta.get("size")) != int(st.st_size):
+                return False
+            if dataset_meta.get("mtime_ns") is not None and int(dataset_meta.get("mtime_ns")) != int(st.st_mtime_ns):
+                return False
+        except Exception:
+            pass
+
+        preencode_meta = cached.get("preencode")
+        if isinstance(preencode_meta, dict):
+            if int(preencode_meta.get("context_frames", -1)) != int(context_frames):
+                return False
+            if int(preencode_meta.get("frame_spacing", -1)) != int(frame_spacing):
+                return False
+        else:
+            # Old caches didn't include preencode settings; those were always 1-frame.
+            if int(context_frames) != 1:
+                return False
+
+        tok_meta = cached.get("tokenizer")
+        if isinstance(tok_meta, dict) and tok_meta:
+            return tok_meta == _tokenizer_fingerprint(tokenizer)
+        return True
+
+    # Back-compat: accept equivalent paths even if absolute/relative differs.
+    if int(context_frames) != 1:
+        return False
+    cached_path = cached.get("data_path")
+    cached_norm = cached.get("data_path_norm")
+    if cached_norm is not None:
+        return str(cached_norm) == _norm_path(data_path)
+    return _paths_equivalent(cached_path, data_path)
+
+
+def _cuda_mem() -> str:
+    if not torch.cuda.is_available():
+        return "cuda=n/a"
+    alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+    reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+    max_alloc_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    return f"cuda_mem alloc={alloc_gb:.2f}GB reserved={reserved_gb:.2f}GB max_alloc={max_alloc_gb:.2f}GB"
+
+
+def _default_action_names_for_dim(action_dim: int) -> list[str]:
+    base = [
+        "lx",
+        "ly",
+        "rx",
+        "ry",
+        "space",
+        "ctrl",
+        "shift",
+        "e",
+        "lmb",
+        "rmb",
+        "q",
+        "r",
+        "f",
+        "g",
+        "c",
+        "v",
+        "1",
+        "2",
+        "3",
+        "4",
+    ]
+    if action_dim == 20:
+        return base
+    if action_dim == 25:
+        return base + ["x", "z", "enter", "esc", "i"]
+    return [f"dim_{i}" for i in range(action_dim)]
+
+
+def _action_col(action_seq: np.ndarray, action_names: list[str] | None, *names: str) -> np.ndarray:
+    """
+    Return a (T,) vector for the first matching action name in `names`.
+    If not found (or action_names missing/mismatched), return zeros.
+    """
+    if action_seq.ndim != 2:
+        raise ValueError(f"Expected action_seq shape (T, A), got {action_seq.shape}")
+    t = action_seq.shape[0]
+    a = action_seq.shape[1]
+    if not action_names or len(action_names) != a:
+        return np.zeros((t,), dtype=np.float32)
+
+    lookup = {n: i for i, n in enumerate(action_names)}
+    for name in names:
+        idx = lookup.get(name)
+        if idx is not None:
+            return action_seq[:, idx].astype(np.float32, copy=False)
+    return np.zeros((t,), dtype=np.float32)
+
+
+def _safe_action_col_by_index(action_seq: np.ndarray, idx: int) -> np.ndarray:
+    if action_seq.ndim != 2:
+        raise ValueError(f"Expected action_seq shape (T, A), got {action_seq.shape}")
+    if 0 <= idx < action_seq.shape[1]:
+        return action_seq[:, idx].astype(np.float32, copy=False)
+    return np.zeros((action_seq.shape[0],), dtype=np.float32)
+
+
+def map_buttons(action_seq: np.ndarray, action_names: list[str] | None = None) -> np.ndarray:
+    """
+    Map converter action layout (usually 20D or 25D, names like 'space', 'ctrl', 'lmb')
+    into NitroGen button tensor aligned with BUTTON_ACTION_TOKENS.
+    """
+    btn = np.zeros((action_seq.shape[0], len(BUTTON_ACTION_TOKENS)), dtype=np.float32)
     idx = {name: BUTTON_ACTION_TOKENS.index(name) for name in BUTTON_ACTION_TOKENS}
 
+    # If names are missing/mismatched, fall back to the converter's canonical index layout.
+    if not action_names or len(action_names) != action_seq.shape[1]:
+        action_names = _default_action_names_for_dim(int(action_seq.shape[1]))
+
+    def col(*names: str, fallback_idx: int | None = None) -> np.ndarray:
+        if action_names and len(action_names) == action_seq.shape[1]:
+            return _action_col(action_seq, action_names, *names)
+        if fallback_idx is None:
+            return np.zeros((action_seq.shape[0],), dtype=np.float32)
+        return _safe_action_col_by_index(action_seq, fallback_idx)
+
     # Shoulders/triggers/thumbs
-    btn[:, idx["LEFT_SHOULDER"]] = a25[:, 10]  # q
-    btn[:, idx["LEFT_TRIGGER"]] = a25[:, 5]    # ctrl
-    btn[:, idx["LEFT_THUMB"]] = a25[:, 12]     # f
-    btn[:, idx["RIGHT_SHOULDER"]] = a25[:, 11] # r
-    btn[:, idx["RIGHT_TRIGGER"]] = np.maximum(a25[:, 6], a25[:, 18])  # shift or 3
-    btn[:, idx["RIGHT_THUMB"]] = a25[:, 13]    # g
+    btn[:, idx["LEFT_SHOULDER"]] = col("q", fallback_idx=10)
+    btn[:, idx["LEFT_TRIGGER"]] = col("ctrl", fallback_idx=5)
+    btn[:, idx["LEFT_THUMB"]] = col("f", fallback_idx=12)
+    btn[:, idx["RIGHT_SHOULDER"]] = col("r", fallback_idx=11)
+    btn[:, idx["RIGHT_TRIGGER"]] = np.maximum(col("shift", fallback_idx=6), col("3", fallback_idx=18))
+    btn[:, idx["RIGHT_THUMB"]] = col("g", fallback_idx=13)
 
     # Face/buttons
-    btn[:, idx["SOUTH"]] = a25[:, 4]                         # space
-    btn[:, idx["WEST"]] = np.maximum(a25[:, 8], a25[:, 20])  # lmb or x
-    btn[:, idx["EAST"]] = a25[:, 9]                          # rmb
-    btn[:, idx["NORTH"]] = a25[:, 7]                         # e
-    btn[:, idx["RIGHT_BOTTOM"]] = a25[:, 15]                 # v
-    btn[:, idx["RIGHT_UP"]] = a25[:, 14]                     # c
+    btn[:, idx["SOUTH"]] = col("space", fallback_idx=4)
+    btn[:, idx["WEST"]] = np.maximum(col("lmb", fallback_idx=8), col("x", fallback_idx=20))
+    btn[:, idx["EAST"]] = col("rmb", fallback_idx=9)
+    btn[:, idx["NORTH"]] = col("e", fallback_idx=7)
+    btn[:, idx["RIGHT_BOTTOM"]] = col("v", fallback_idx=15)
+    btn[:, idx["RIGHT_UP"]] = col("c", fallback_idx=14)
 
     # System/menu
-    btn[:, idx["BACK"]] = a25[:, 23]   # esc
-    btn[:, idx["START"]] = a25[:, 22]  # enter
+    btn[:, idx["BACK"]] = col("esc", "escape", fallback_idx=23)
+    btn[:, idx["START"]] = col("enter", "return", fallback_idx=22)
     return btn
 
 
@@ -75,6 +268,9 @@ class NitroGenDataset(Dataset):
         path: Path,
         image_processor,
         action_horizon: int,
+        context_frames: int = 1,
+        frame_spacing: int = 1,
+        expected_action_dim: int | None = 25,
         game: str | None = None,
         tokenizer: NitrogenTokenizer | None = None,
         preencode: bool = False,
@@ -88,23 +284,43 @@ class NitroGenDataset(Dataset):
             )
         self.obs = raw["obs"].numpy() if isinstance(raw["obs"], torch.Tensor) else raw["obs"]
         self.actions = raw["actions"].numpy() if isinstance(raw["actions"], torch.Tensor) else raw["actions"]
+        meta = raw.get("meta", {}) if isinstance(raw, dict) else {}
+        action_names = meta.get("action_names") if isinstance(meta, dict) else None
+        self.action_names: list[str] | None = list(action_names) if isinstance(action_names, (list, tuple)) else None
         self.image_processor = image_processor
         self.action_horizon = action_horizon
         self.game = game
         self.preencode = preencode
         self.tokenizer = tokenizer
+        self.context_frames = int(context_frames)
+        self.frame_spacing = int(frame_spacing)
         self._encoded: list[dict] | None = None
 
+        if self.context_frames < 1:
+            raise ValueError(f"context_frames must be >= 1, got {self.context_frames}")
+        if self.frame_spacing < 1:
+            raise ValueError(f"frame_spacing must be >= 1, got {self.frame_spacing}")
+
         if self.actions.ndim != 3:
-            raise ValueError(f"Expected actions shape (N, T, 25), got {self.actions.shape}")
-        if self.actions.shape[-1] != 25:
-            raise ValueError(f"Expected 25-D actions, got {self.actions.shape[-1]}D")
+            raise ValueError(f"Expected actions shape (N, T, A), got {self.actions.shape}")
+        if expected_action_dim is not None and self.actions.shape[-1] != expected_action_dim:
+            raise ValueError(
+                f"Dataset action_dim={self.actions.shape[-1]} does not match expected_action_dim={expected_action_dim}. "
+                "Re-run convert_to_nitrogen.py with --action-dim 25 (NitroGen/serve.py default)."
+            )
+        if expected_action_dim is None and self.actions.shape[-1] not in (20, 25):
+            raise ValueError(f"Expected converter action_dim 20 or 25, got {self.actions.shape[-1]}D.")
         if self.actions.shape[1] != action_horizon:
             raise ValueError(
-                f"Dataset horizon {self.actions.shape[1]} does not match model horizon {action_horizon}"
+                f"Dataset horizon T={self.actions.shape[1]} does not match model action_horizon={action_horizon}. "
+                "Re-run convert_to_nitrogen.py with --seq-len set to action_horizon (ng.pt uses 18)."
             )
         if self.obs.ndim != 4:
             raise ValueError(f"Expected obs shape (N, 3, H, W), got {self.obs.shape}")
+        if self.action_names is not None and len(self.action_names) != self.actions.shape[-1]:
+            raise ValueError(
+                f"meta.action_names length ({len(self.action_names)}) does not match action_dim ({self.actions.shape[-1]})."
+            )
         if preencode and tokenizer is None:
             raise ValueError("preencode=True requires a tokenizer")
         if preencode:
@@ -112,9 +328,20 @@ class NitroGenDataset(Dataset):
             print(f"[{time.strftime('%H:%M:%S')}] [+] Preencoding {len(self)} samples...")
             if preencode_cache_path is not None and preencode_cache_path.exists():
                 try:
-                    cached = torch.load(preencode_cache_path, map_location="cpu")
-                    if cached.get("data_path") == str(path):
-                        self._encoded = cached["encoded"]
+                    cached = torch.load(preencode_cache_path, map_location="cpu", weights_only=False)
+                    if _preencode_cache_matches(
+                        cached,
+                        data_path=path,
+                        tokenizer=tokenizer,
+                        context_frames=self.context_frames,
+                        frame_spacing=self.frame_spacing,
+                    ):
+                        encoded = cached.get("encoded")
+                        if not isinstance(encoded, list) or len(encoded) != len(self):
+                            raise ValueError(
+                                f"invalid encoded payload (type={type(encoded).__name__}, len={len(encoded) if isinstance(encoded, list) else 'n/a'})"
+                            )
+                        self._encoded = encoded
                         print(
                             f"[{time.strftime('%H:%M:%S')}] [+] Loaded preencode cache from {preencode_cache_path} "
                             f"in {time.time() - t0:.2f}s."
@@ -123,11 +350,29 @@ class NitroGenDataset(Dataset):
                         print(f"[{time.strftime('%H:%M:%S')}] [warn] preencode cache data mismatch; recomputing.")
                 except Exception as e:
                     print(f"[{time.strftime('%H:%M:%S')}] [warn] failed to load preencode cache ({e}); recomputing.")
+                    try:
+                        preencode_cache_path.unlink()
+                    except Exception:
+                        pass
             if self._encoded is None:
                 self._preencode_all()
                 if preencode_cache_path is not None:
                     try:
-                        torch.save({"data_path": str(path), "encoded": self._encoded}, preencode_cache_path)
+                        payload = {
+                            "format": "nitrogen-preencode-cache",
+                            "version": 2,
+                            "dataset": _file_fingerprint(path),
+                            "tokenizer": _tokenizer_fingerprint(tokenizer),
+                            "preencode": {
+                                "context_frames": int(self.context_frames),
+                                "frame_spacing": int(self.frame_spacing),
+                            },
+                            # Back-compat keys (older trainers used these):
+                            "data_path": str(path),
+                            "data_path_norm": _norm_path(path),
+                            "encoded": self._encoded,
+                        }
+                        _atomic_torch_save(payload, preencode_cache_path)
                         print(
                             f"[{time.strftime('%H:%M:%S')}] [+] Saved preencode cache to {preencode_cache_path} "
                             f"in {time.time() - t0:.2f}s."
@@ -143,25 +388,49 @@ class NitroGenDataset(Dataset):
         return self.actions.shape[0]
 
     def _prepare_sample(self, idx: int) -> Dict[str, torch.Tensor | np.ndarray | str]:
-        frame = self.obs[idx]  # (3, H, W) in [0,1]
-        if frame.shape[0] not in (1, 3):
-            raise ValueError(f"Unexpected frame shape {frame.shape}, expected channels-first")
-        frame_hwc = np.transpose(frame, (1, 2, 0)).astype(np.float32)
-        frame_hwc = np.clip(frame_hwc * 255.0, 0, 255).astype(np.uint8)
-        pixel_values = self.image_processor([frame_hwc], return_tensors="pt")["pixel_values"][0]
-        pixel_values = pixel_values.unsqueeze(0)
+        frames_hwc: list[np.ndarray] = []
+        dropped: list[bool] = []
+        for t in range(self.context_frames):
+            # Oldest -> newest.
+            offset = (self.context_frames - 1 - t) * self.frame_spacing
+            src_idx = idx - offset
+            if src_idx < 0:
+                src_idx = 0
+                dropped.append(True)
+            else:
+                dropped.append(False)
+            frame = self.obs[src_idx]  # (3, H, W) in [0,1]
+            if frame.shape[0] not in (1, 3):
+                raise ValueError(f"Unexpected frame shape {frame.shape}, expected channels-first")
+            frame_hwc = np.transpose(frame, (1, 2, 0)).astype(np.float32)
+            frame_hwc = np.clip(frame_hwc * 255.0, 0, 255).astype(np.uint8)
+            frames_hwc.append(frame_hwc)
+
+        pixel_values = self.image_processor(frames_hwc, return_tensors="pt")["pixel_values"]
 
         action_seq = self.actions[idx].astype(np.float32)
-        buttons = torch.from_numpy(map_buttons(action_seq)).unsqueeze(0)
-        j_left = torch.from_numpy(action_seq[:, :2]).unsqueeze(0)
-        j_right = torch.from_numpy(action_seq[:, 2:4]).unsqueeze(0)
+        buttons = torch.from_numpy(map_buttons(action_seq, self.action_names)).unsqueeze(0)
+
+        # Joystick axes come from the converter layout; prefer name-based extraction when available.
+        if self.action_names is not None:
+            lx = _action_col(action_seq, self.action_names, "lx")
+            ly = _action_col(action_seq, self.action_names, "ly")
+            rx = _action_col(action_seq, self.action_names, "rx")
+            ry = _action_col(action_seq, self.action_names, "ry")
+            j_left_np = np.stack([lx, ly], axis=-1).astype(np.float32, copy=False)
+            j_right_np = np.stack([rx, ry], axis=-1).astype(np.float32, copy=False)
+        else:
+            j_left_np = action_seq[:, :2]
+            j_right_np = action_seq[:, 2:4]
+        j_left = torch.from_numpy(j_left_np).unsqueeze(0)
+        j_right = torch.from_numpy(j_right_np).unsqueeze(0)
 
         sample: Dict[str, torch.Tensor | np.ndarray | str] = {
             "frames": pixel_values,
             "buttons": buttons,
             "j_left": j_left,
             "j_right": j_right,
-            "dropped_frames": torch.zeros((1,), dtype=torch.bool),
+            "dropped_frames": torch.tensor(dropped, dtype=torch.bool),
             "action": torch.from_numpy(action_seq),
         }
         if self.game is not None:
@@ -193,9 +462,11 @@ class NitroGenDataset(Dataset):
         return self._prepare_sample(idx)  # type: ignore[return-value]
 
 
-def load_base_ckpt(path: Path) -> Tuple[NitroGen, NitrogenTokenizer, CkptConfig]:
-    ckpt = torch.load(path, map_location="cpu")
+def load_base_ckpt(path: Path, *, debug: bool = False) -> Tuple[NitroGen, NitrogenTokenizer, CkptConfig, int, int]:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = CkptConfig.model_validate(ckpt["ckpt_config"])
+    base_step = int(ckpt.get("step", 0) or 0)
+    base_epoch = int(ckpt.get("epoch", 0) or 0)
 
     # Force action history usage if available in the modality config.
     if hasattr(cfg, "modality_cfg") and getattr(cfg.modality_cfg, "action_interleaving", None) is not None:
@@ -206,8 +477,13 @@ def load_base_ckpt(path: Path) -> Tuple[NitroGen, NitrogenTokenizer, CkptConfig]
     game_mapping = tokenizer.game_mapping
 
     model = NitroGen(cfg.model_cfg, game_mapping=game_mapping)
-    model.load_state_dict(ckpt["model"], strict=False)
-    return model, tokenizer, cfg
+    load_res = model.load_state_dict(ckpt["model"], strict=False)
+    if debug:
+        print(
+            f"[{_ts()}] [ckpt] loaded base={path} step={base_step} epoch={base_epoch} "
+            f"(missing={len(load_res.missing_keys)} unexpected={len(load_res.unexpected_keys)})"
+        )
+    return model, tokenizer, cfg, base_step, base_epoch
 
 
 def get_cache_path(data_path: Path) -> Path:
@@ -254,6 +530,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", type=Path, required=True, help="Path to *_nitro.pt produced by convert_to_nitrogen.py")
     p.add_argument("--out", type=Path, required=True, help="Output checkpoint path")
     p.add_argument("--game", type=str, default=None, help="Game name for tokenizer game mapping (if required by ckpt)")
+    p.add_argument(
+        "--context-frames",
+        type=int,
+        default=None,
+        help="Override ckpt_config.modality_cfg.frame_per_sample (number of context frames per sample)",
+    )
+    p.add_argument(
+        "--frame-spacing",
+        type=int,
+        default=None,
+        help="Override ckpt_config.modality_cfg.frame_spacing (dataset index step between context frames)",
+    )
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -265,6 +553,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping (0 to disable)")
     p.add_argument("--log-every", type=int, default=10, help="Print loss every N steps (0 = silent)")
     p.add_argument("--trace-steps", action="store_true", help="Print per-step timings (data/load/total) for debugging")
+    p.add_argument("--debug", action="store_true", help="Verbose startup + more detailed logs (no extra overhead unless enabled)")
     p.add_argument("--cache", action="store_true", default=False, help="Enable periodic cache checkpointing under cache/")
     p.add_argument("--cache-every", type=int, default=50, help="Save cache every N optimizer steps (default 50)")
     p.add_argument("--cache-load", action="store_true", default=False, help="Load from cache if present without saving")
@@ -286,20 +575,42 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
         print(f"[{time.strftime('%H:%M:%S')}] [info] ultra-fast mode: TF32/benchmark enabled (cache/log settings unchanged)")
 
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA GPU not available; this trainer requires a CUDA-capable device.")
+    # if not torch.cuda.is_available():
+        # raise SystemExit("CUDA GPU not available; this trainer requires a CUDA-capable device.")
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
 
-    model, tokenizer, cfg = load_base_ckpt(args.base_ckpt)
+    if args.debug:
+        try:
+            dev_idx = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(dev_idx)
+            total_gb = props.total_memory / (1024**3)
+            print(
+                f"[{_ts()}] [debug] python={sys.version.split()[0]} torch={torch.__version__} "
+                f"cuda={torch.version.cuda} cudnn={torch.backends.cudnn.version()} "
+                f"gpu={props.name} vram={total_gb:.1f}GB"
+            )
+        except Exception:
+            print(f"[{_ts()}] [debug] python={sys.version.split()[0]} torch={torch.__version__} cuda_available=True")
+        print(f"[{_ts()}] [debug] args={vars(args)}")
+
+    model, tokenizer, cfg, base_step, base_epoch = load_base_ckpt(args.base_ckpt, debug=args.debug)
+    modality_update: dict = {}
+    if args.context_frames is not None:
+        modality_update["frame_per_sample"] = int(args.context_frames)
+    if args.frame_spacing is not None:
+        modality_update["frame_spacing"] = int(args.frame_spacing)
+    if modality_update:
+        cfg = cfg.model_copy(update={"modality_cfg": cfg.modality_cfg.model_copy(update=modality_update)}, deep=True)
     tokenizer.train()
     model.to(device).train()
 
     model_horizon = cfg.model_cfg.action_horizon
     if hasattr(cfg, "modality_cfg"):
         print(
-            f"[{time.strftime('%H:%M:%S')}] [info] action_interleaving={getattr(cfg.modality_cfg, 'action_interleaving', None)} "
-            f"(context frames: {getattr(cfg.modality_cfg, 'frame_per_sample', 'n/a')})"
+            f"[{_ts()}] [info] action_interleaving={getattr(cfg.modality_cfg, 'action_interleaving', None)} "
+            f"(context frames: {getattr(cfg.modality_cfg, 'frame_per_sample', 'n/a')}) "
+            f"action_horizon={model_horizon} action_dim={getattr(cfg.model_cfg, 'action_dim', None)}"
         )
     image_processor = AutoImageProcessor.from_pretrained(cfg.model_cfg.vision_encoder_name, use_fast=True)
 
@@ -310,11 +621,18 @@ def main() -> None:
         path=args.data,
         image_processor=image_processor,
         action_horizon=model_horizon,
+        context_frames=getattr(cfg.modality_cfg, "frame_per_sample", 1),
+        frame_spacing=getattr(cfg.modality_cfg, "frame_spacing", 1) or 1,
+        expected_action_dim=getattr(cfg.model_cfg, "action_dim", 25),
         game=args.game,
         tokenizer=tokenizer if args.preencode else None,
         preencode=args.preencode,
         preencode_cache_path=get_preencode_cache_path(args.data) if args.preencode else None,
     )
+    if args.debug:
+        print(f"[{_ts()}] [debug] dataset len={len(dataset)} obs={getattr(dataset.obs, 'shape', None)} actions={getattr(dataset.actions, 'shape', None)}")
+        if getattr(dataset, "action_names", None):
+            print(f"[{_ts()}] [debug] dataset meta.action_names[0:8]={dataset.action_names[:8]}")
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -351,6 +669,7 @@ def main() -> None:
     start_epoch = 0
     start_step_in_epoch = 0
     global_step = 0
+    opt_step = 0
     cache_path = get_cache_path(args.data)
     progress_log = get_progress_log_path(args.data)
 
@@ -362,14 +681,15 @@ def main() -> None:
                 start_epoch = ck.get("epoch", 0)
                 start_step_in_epoch = ck.get("step_in_epoch", 0)
                 global_step = ck.get("global_step", 0)
+                opt_step = ck.get("opt_step", global_step // max(int(args.grad_accum), 1))
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] [info] resumed from cache epoch {start_epoch+1}, "
-                    f"step {start_step_in_epoch+1}"
+                    f"[{_ts()}] [info] resumed from cache epoch {start_epoch+1}, "
+                    f"step {start_step_in_epoch+1} (global_step={global_step}, opt_step={opt_step})"
                 )
             else:
-                print(f"[{time.strftime('%H:%M:%S')}] [info] cache data_path mismatch; starting fresh.")
+                print(f"[{_ts()}] [info] cache data_path mismatch; starting fresh.")
         except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] [warn] failed to load cache ({e}); removing corrupted cache.")
+            print(f"[{_ts()}] [warn] failed to load cache ({e}); removing corrupted cache.")
             try:
                 cache_path.unlink()
             except Exception:
@@ -377,6 +697,7 @@ def main() -> None:
             start_epoch = 0
             start_step_in_epoch = 0
             global_step = 0
+            opt_step = 0
 
     steps_per_epoch = len(dataloader)
     total_steps = steps_per_epoch * args.epochs
@@ -387,8 +708,9 @@ def main() -> None:
     last_step_end = time.time()
     first_batch_logged = False
     step_durations = deque(maxlen=50)
+    last_grad_norm: float | None = None
     for epoch in range(start_epoch, args.epochs):
-        print(f"[{time.strftime('%H:%M:%S')}] [epoch {epoch+1}/{args.epochs}] start ({steps_per_epoch} steps)")
+        print(f"[{_ts()}] [epoch {epoch+1}/{args.epochs}] start ({steps_per_epoch} steps) base_step={base_step} base_epoch={base_epoch}")
         for step, batch in enumerate(dataloader):
             if epoch == start_epoch and step < start_step_in_epoch:
                 continue
@@ -399,11 +721,18 @@ def main() -> None:
                 start_step = global_step
                 if args.num_workers > 0 and not first_batch_logged:
                     print(
-                        f"[{time.strftime('%H:%M:%S')}] [info] first batch received from workers "
+                        f"[{_ts()}] [info] first batch received from workers "
                         f"(workers={args.num_workers}, prefetch_factor={args.prefetch_factor})"
                     )
                     first_batch_logged = True
+                if args.debug:
+                    try:
+                        shapes = {k: (tuple(v.shape) if hasattr(v, "shape") else type(v).__name__) for k, v in batch.items()}
+                        print(f"[{_ts()}] [debug] first batch keys/shapes: {shapes}")
+                    except Exception:
+                        pass
             if args.preencode:
+                t_to_device0 = time.time()
                 model_inputs: Dict[str, torch.Tensor] = {}
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
@@ -412,9 +741,12 @@ def main() -> None:
                         model_inputs[k] = torch.from_numpy(v).to(device, non_blocking=True)
                     else:
                         model_inputs[k] = v
+                encode_time = 0.0
+                to_device_time = time.time() - t_to_device0
             else:
                 batch_size = batch["frames"].shape[0]
                 stacked: Dict[str, list] = {}
+                t_encode0 = time.time()
                 for b in range(batch_size):
                     sample = {
                         "frames": batch["frames"][b].cpu().numpy(),
@@ -428,7 +760,9 @@ def main() -> None:
                     enc = tokenizer.encode(sample)
                     for k, v in enc.items():
                         stacked.setdefault(k, []).append(v)
+                encode_time = time.time() - t_encode0
 
+                t_to_device0 = time.time()
                 model_inputs = {}
                 for k, vals in stacked.items():
                     first = vals[0]
@@ -438,21 +772,26 @@ def main() -> None:
                         model_inputs[k] = torch.from_numpy(np.stack(vals)).to(device, non_blocking=True)
                     else:
                         model_inputs[k] = vals
+                to_device_time = time.time() - t_to_device0
 
             with torch.amp.autocast(device_type="cuda", enabled=args.amp):
                 out = model(model_inputs)
                 loss = out["loss"] if isinstance(out, dict) and "loss" in out else out
                 loss = loss.mean()
 
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at global_step={global_step}: {loss.item()}")
+
             scaler.scale(loss).backward()
 
             if global_step % args.grad_accum == 0:
                 if args.max_grad_norm > 0:
                     scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    last_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm))
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad()
+                opt_step += 1
 
             data_time = step_start - last_step_end
             iter_time = time.time() - step_start
@@ -482,17 +821,29 @@ def main() -> None:
                 eta_txt = f"ETA~{eta_h:02d}:{eta_min:02d}:{eta_sec:02d}"
             else:
                 eta_txt = "ETA~TBD"
-            print(
-                f"[{time.strftime('%H:%M:%S')}] [{bar}] {pct:5.1f}% "
-                f"[epoch {epoch+1}/{args.epochs} step {step+1}/{steps_per_epoch} "
-                f"(opt_step {opt_step_idx}/{total_opt_steps})] "
-                f"accum={accum_state} loss={loss.item():.4f} step_time={iter_time:.2f}s "
-                f"{eta_txt}"
-            )
+            should_log = args.log_every > 0 and (global_step % args.log_every == 0 or step + 1 == steps_per_epoch)
+            if should_log:
+                lr = opt.param_groups[0].get("lr", None)
+                extra = ""
+                if args.debug:
+                    extra = f" encode={encode_time:.2f}s to_device={to_device_time:.2f}s"
+                    if last_grad_norm is not None:
+                        extra += f" grad_norm={last_grad_norm:.3f}"
+                    if args.amp:
+                        extra += f" scale={float(scaler.get_scale()):.1f}"
+                    extra += f" {_cuda_mem()}"
+                print(
+                    f"[{_ts()}] [{bar}] {pct:5.1f}% "
+                    f"[epoch {epoch+1}/{args.epochs} step {step+1}/{steps_per_epoch} "
+                    f"(opt_step {opt_step_idx}/{total_opt_steps})] "
+                    f"accum={accum_state} loss={loss.item():.4f} lr={lr} step_time={iter_time:.2f}s "
+                    f"{eta_txt}{extra}"
+                )
             if args.trace_steps:
                 fwd_time = iter_time - data_time
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] [trace] step {step+1}: data_time={data_time:.3f}s, "
+                    f"[{_ts()}] [trace] step {step+1}: data_time={data_time:.3f}s, "
+                    f"encode_time={encode_time:.3f}s, to_device_time={to_device_time:.3f}s, "
                     f"fwd_bwd_time={fwd_time:.3f}s, accum={accum_state}"
                 )
             # Track step time with a cap to reduce ETA swing
@@ -524,20 +875,36 @@ def main() -> None:
                     "epoch": epoch,
                     "step_in_epoch": step,
                     "global_step": global_step,
+                    "opt_step": opt_step,
                     "args": vars(args),
                 }
                 safe_save_cache(cache_state, cache_path)
 
         cfg_to_save = cfg.model_copy(deep=True)
         cfg_to_save.tokenizer_cfg.training = False  # store inference-ready config
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "ckpt_config": cfg_to_save.model_dump(),
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        finetune_epoch = int(epoch + 1)
+        total_epoch = int(base_epoch + finetune_epoch)
+        total_step = int(base_step + opt_step)
+        payload = {
+            "model": model.state_dict(),
+            # Keep legacy top-level fields meaningful: total progress (base + finetune).
+            "step": total_step,
+            "epoch": total_epoch,
+            "ckpt_config": cfg_to_save.model_dump(),
+            # Extra metadata for clarity/debugging.
+            "finetune": {
+                "epoch": finetune_epoch,
+                "global_step": int(global_step),
+                "opt_step": int(opt_step),
+                "grad_accum": int(args.grad_accum),
+                "steps_per_epoch": int(steps_per_epoch),
+                "base_step": int(base_step),
+                "base_epoch": int(base_epoch),
             },
-            args.out,
-        )
-        print(f"[+] Epoch {epoch+1} finished. Saved checkpoint to {args.out}")
+        }
+        _atomic_torch_save(payload, args.out)
+        print(f"[+] Epoch {epoch+1} finished. Saved checkpoint to {args.out} (epoch={total_epoch} step={total_step})")
 
 
 if __name__ == "__main__":
