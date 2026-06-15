@@ -1,0 +1,11 @@
+model:
+  vision_encoder_name: "google/siglip-large-patch16-256"
+  vision_hidden_size: 1024
+  action_dim: 25
+  action_horizon: 16
+  hidden_size: 1024
+  diffusion:
+    num_inference_timesteps: 10
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0

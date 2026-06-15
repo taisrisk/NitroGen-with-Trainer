@@ -57,6 +57,11 @@ class FastPolicyExecutor:
             if frame_hwc is None:
                 raise ValueError("No visual frame provided to policy.")
 
+            # Defensive check: The DiT model implicitly expects exactly 256x256 dimensions.
+            if frame_hwc.shape[0] != 256 or frame_hwc.shape[1] != 256:
+                import cv2
+                frame_hwc = cv2.resize(frame_hwc, (256, 256), interpolation=cv2.INTER_AREA)
+
             frame_chw = np.transpose(frame_hwc, (2, 0, 1)) # (H,W,C) -> (C,H,W)
             frame_seq = np.expand_dims(frame_chw, axis=0)  # (1, C, H, W)
             frame_batch = np.expand_dims(frame_seq, axis=0) # (1, 1, C, H, W)

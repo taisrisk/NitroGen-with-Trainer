@@ -1,6 +1,9 @@
 import time
 import argparse
 import yaml
+import cv2
+import numpy as np
+from PIL import Image
 
 from nitrogen.game_env import GamepadEnv
 try:
@@ -8,10 +11,11 @@ try:
 except ImportError:
     KeyboardMouseEmulator = None
 
-from core.vision.state_encoder import VisionStateEncoder
+from core.vision.state_encoder import VisionStateEncoderFactory
 from core.memory.helix_memory import EpisodicMemory
 from core.brain.system2 import MicroLLMBrain
 from core.policy.system1 import FastPolicyExecutor
+from core.pipeline import AgentPipeline
 
 def load_config(config_path="config/system.yaml"):
     try:
@@ -32,14 +36,12 @@ def run_agent():
     args = parser.parse_args()
 
     cfg = load_config()
-
     print("\n--- Booting Universal Cognitive Architecture ---")
 
     # 1. Initialize Memory (HelixDB)
     memory_db = EpisodicMemory(db_url=cfg["memory"]["helixdb_url"])
 
     # 2. Initialize Brain (Ollama/Qwen asynchronous reasoning loop)
-    # The Brain evaluates at a slow Hz, maintaining intent persistence
     brain = MicroLLMBrain(
         memory_db=memory_db,
         model_name=cfg["brain"]["model_name"],
@@ -49,7 +51,10 @@ def run_agent():
     brain.start()
 
     # 3. Initialize Vision (Semantic Temporal State Extractor)
-    vision = VisionStateEncoder(target_resolution=tuple(cfg["agent"].get("resolution", [256, 256])))
+    vision = VisionStateEncoderFactory.create(
+        backend="siglip",
+        target_resolution=tuple(cfg["agent"].get("resolution", [256, 256]))
+    )
 
     # 4. Initialize Policy (Fast Hierarchical Action Head)
     policy = FastPolicyExecutor(ckpt_path=args.ckpt)
@@ -65,96 +70,63 @@ def run_agent():
         enable_controller=False, # Using KBM
         screenshot_backend="dxcam"
     )
+    env.reset()
+    env.pause()
 
     if KeyboardMouseEmulator:
         kbm = KeyboardMouseEmulator(token_to_keys={}, config=KBMConfig())
     else:
         kbm = None
 
-    print(f"\n--- System Online. Target FPS: {cfg['agent']['target_fps']} ---")
+    # Pipeline Interface Definitions
+    def capture_fn():
+        # Actual environment screen capture
+        obs = env.render()
+        if isinstance(obs, Image.Image):
+            return np.array(obs)
+        return obs
 
-    env.reset()
-    env.pause()
-    obs = env.render()
+    def execute_fn(hierarchical_action):
+        hardware_action = policy.translate_to_hardware(hierarchical_action)
+        if kbm:
+            kbm.step_keys(
+                keys_down=hardware_action["keys_down"],
+                lmb=hardware_action["lmb"],
+                rmb=hardware_action["rmb"],
+                mouse_dx=hardware_action["mouse_dx"],
+                mouse_dy=hardware_action["mouse_dy"],
+                duration_s=0.0
+            )
 
-    step_duration = 1.0 / cfg['agent']['target_fps']
-    step_count = 0
+    # 6. Initialize Multi-Threaded Latency Pipeline
+    pipeline = AgentPipeline(
+        capture_fn=capture_fn,
+        vision_fn=vision.encode,
+        policy_fn=policy.decide_hierarchical_action,
+        execution_fn=execute_fn
+    )
 
-    # Track the last action taken for memory logging
-    last_action_macro = "WAIT"
+    print(f"\n--- Pipeline Online. Target FPS: {cfg['agent']['target_fps']} ---")
+    pipeline.start()
 
     try:
-        import numpy as np
-        from PIL import Image
-
         while True:
-            loop_start = time.perf_counter()
+            # Main thread manages the slow LLM intent sync and memory logging
+            # extracting state from the pipeline queues safely
 
-            # --- 1. OBSERVE (Vision) ---
-            if isinstance(obs, Image.Image):
-                raw_pixels = np.array(obs)
-            else:
-                raw_pixels = obs
+            # (In a full implementation, we'd hook specific event flags from the
+            # vision encoder to trigger memory_db.log_experience here).
 
-            state_dict = vision.encode(raw_pixels)
-
-            # --- 2. UNDERSTAND (Brain Sync) ---
-            brain.update_state({
-                "semantic_state": state_dict["semantic_state"],
-                "status": state_dict["status"]
-            })
-
-            # The intent persists across multiple frames to prevent chaotic oscillation
+            # Sync the latest intent into the high-speed pipeline
             current_intent = brain.get_current_intent()
+            pipeline.set_intent(current_intent)
 
-            # --- 3. DECIDE (Policy) ---
-            # Fast neural evaluation: Semantic State + Intent -> Hierarchical Action
-            hierarchical_action = policy.decide_hierarchical_action(state_dict["semantic_state"], current_intent)
-
-            # --- 4. ACT (Execution) ---
-            # Action translates directly to KBM outputs regardless of LLM status
-            hardware_action = policy.translate_to_hardware(hierarchical_action)
-
-            if kbm:
-                kbm.step_keys(
-                    keys_down=hardware_action["keys_down"],
-                    lmb=hardware_action["lmb"],
-                    rmb=hardware_action["rmb"],
-                    mouse_dx=hardware_action["mouse_dx"],
-                    mouse_dy=hardware_action["mouse_dy"],
-                    duration_s=0.0
-                )
-
-            obs = env.render()
-
-            # --- 5. LOG & LEARN (Memory Loop) ---
-            # Credit Assignment via Critical Factor tagging
-            boss_action = state_dict["semantic_state"].get("boss_action", "unknown")
-            state_hash = f"state_boss_{boss_action}"
-
-            # Simulated death condition evaluation
-            if hierarchical_action == "ATTACK_MELEE" and boss_action == "windup":
-                memory_db.log_experience(
-                    state_hash=state_hash,
-                    intent=current_intent,
-                    action=hierarchical_action,
-                    result="died",
-                    reward=-1,
-                    critical_factor="unsafe healing window; boss was winding up"
-                )
-
-            last_action_macro = hierarchical_action
-
-            step_count += 1
-            if step_count % 100 == 0:
-                print(f"[Loop {step_count}] Intent: {current_intent} | Policy Act: {hierarchical_action}")
-
-            elapsed = time.perf_counter() - loop_start
-            time.sleep(max(0, step_duration - elapsed))
+            time.sleep(0.1) # Main thread spins slowly while pipeline goes fast
 
     except KeyboardInterrupt:
         print("\nShutting down Agent...")
     finally:
+        pipeline.stop()
         brain.stop()
         if kbm:
             kbm.release_all()
