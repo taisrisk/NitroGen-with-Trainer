@@ -264,9 +264,8 @@ if __name__ == "__main__":
                     try:
                         t_recv = time.time()
                         raw_image = request["image"]
-                        game_str = request.get("game")
                         command_id += 1
-                        result = session.predict(raw_image, game=game_str)
+                        result = session.predict(raw_image)
                         t_done = time.time()
                         response = {
                             "status": "ok",

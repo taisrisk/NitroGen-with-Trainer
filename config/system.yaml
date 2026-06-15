@@ -1,0 +1,16 @@
+agent:
+  target_fps: 30
+  resolution: [1280, 720]
+
+brain:
+  model_repo: "Qwen/Qwen2.5-3B-Instruct-GGUF"
+  model_filename: "qwen2.5-3b-instruct-q4_k_m.gguf"
+  n_ctx: 2048
+  reasoning_hz: 1.0 # Times per second the brain evaluates state
+
+memory:
+  helixdb_url: "http://127.0.0.1:8000"
+  enabled: true
+
+policy:
+  backend: "kbm" # keyboard/mouse

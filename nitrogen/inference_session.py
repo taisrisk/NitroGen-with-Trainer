@@ -410,12 +410,8 @@ class InferenceSession:
         self.obs_buffer.clear()
         self.action_buffer.clear()
 
-    def predict(self, obs, game: str = None):
+    def predict(self, obs):
         start_time = time.time()
-
-        # Update selected_game if dynamically provided via inference client (e.g. LLM strategy)
-        if game is not None:
-            self.selected_game = game
 
         current_frame = self.img_proc([obs], return_tensors="pt")["pixel_values"]
         self.obs_buffer.append(current_frame)

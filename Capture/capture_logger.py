@@ -510,14 +510,6 @@ def main() -> None:
                 capture_state = "paused"
                 input_state.clear_mouse()
                 print("[*] Capture PAUSED (Ctrl+P)")
-        elif action == "1":
-            if input_state.state.get("ctrl", False):
-                recent_events.append({"frame_id": frame_id, "tag": "[DODGE_MODE=1]"})
-                print(f"[*] Tagged event: DODGE_MODE at frame {frame_id}")
-        elif action == "2":
-            if input_state.state.get("ctrl", False):
-                recent_events.append({"frame_id": frame_id, "tag": "[ATTACK_MODE=1]"})
-                print(f"[*] Tagged event: ATTACK_MODE at frame {frame_id}")
 
     def on_press(k):
         action = key_to_action(k, allowed_actions)
@@ -573,7 +565,6 @@ def main() -> None:
     chunk_id = 1
     chunk_meta: List[dict] = []
     chunk_start_frame = 1
-    recent_events = []
     chunk_frame_count = 0
     chunk_dir = frames_dir / f"chunk_{chunk_id:03d}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -792,7 +783,6 @@ def main() -> None:
         "num_chunks": int(len(chunk_meta)),
         "chunks": chunk_meta,
         "torch_dataset": torch_info,
-        "recent_events": recent_events,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
