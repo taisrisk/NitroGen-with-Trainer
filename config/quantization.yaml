@@ -1,0 +1,7 @@
+quantization:
+  mode: "auto" # Options: auto, nf4, int8, fp16, bf16, none
+  qlora_enabled: true
+  bnb_4bit:
+    quant_type: "nf4"
+    use_double_quant: true
+    compute_dtype: "bfloat16" # Falls back to fp16 if unsupported
