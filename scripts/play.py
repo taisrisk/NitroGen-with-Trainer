@@ -14,6 +14,7 @@ from nitrogen.shared import BUTTON_ACTION_TOKENS, PATH_REPO
 from nitrogen.inference_viz import create_viz, VideoRecorder
 from nitrogen.inference_client import ModelClient
 from nitrogen.kbm_emulator import KeyboardMouseEmulator, KBMConfig
+from ollama_system2 import OllamaSystem2
 
 try:
     import win32api
@@ -182,9 +183,6 @@ zero_action = OrderedDict(
             ("NORTH", 0),
         ]
     )
-
-TOKEN_SET: list[str] = BUTTON_ACTION_TOKENS
-IS_KEYBOARD_MODEL = False
 
 
 def _override_pressed() -> bool:
@@ -384,6 +382,10 @@ if args.process == "Cuphead.exe" and env.gamepad_emulator is not None:
 env.reset()
 env.pause()
 
+# Start System 2 Ollama Integration
+system2 = OllamaSystem2(model_name="llama3.2:1b", interval_s=1.0)
+system2.start()
+
 def _pulse_controller_button(button_name: str, pulse_ms: int):
     button_name = str(button_name).strip().upper()
     pulse_s = max(0.02, float(pulse_ms) / 1000.0)
@@ -495,8 +497,14 @@ with VideoRecorder(str(PATH_MP4_DEBUG), fps=60, crf=32, preset="medium") as debu
                 obs.save(PATH_DEBUG / f"{step_count:05d}.png")
 
                 try:
+                    # System 2 injection: Get the latest strategy from Ollama thread
+                    # and push it to the policy inference if the model supports it.
+                    # Currently NitroGen models use 'game' strings to lookup game_ids.
+                    # We can pass the strategy string into predict.
+                    current_strategy = system2.get_strategy()
+
                     t_req0 = time.perf_counter()
-                    pred = policy.predict(obs)
+                    pred = policy.predict(obs, game=current_strategy)
                     t_req1 = time.perf_counter()
                     t_resp = time.time()
                 except Exception as e:

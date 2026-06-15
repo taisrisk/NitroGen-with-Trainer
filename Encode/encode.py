@@ -345,14 +345,17 @@ def map_actions_keyboard_space(
     out[:, :K] = btns.astype(np.float32, copy=False)
 
     # Left stick from WASD/arrows (normalized -1..1)
+    # Conventional controller Y-axis: UP is negative, DOWN is positive.
     lx = col("d", "arrow_right") - col("a", "arrow_left")
-    ly = col("w", "arrow_up") - col("s", "arrow_down")
+    ly = col("s", "arrow_down") - col("w", "arrow_up")
     out[:, K + 0] = np.clip(lx, -1.0, 1.0)
     out[:, K + 1] = np.clip(ly, -1.0, 1.0)
 
     # Right stick from mouse deltas (normalized -1..1)
+    # Mouse move down usually produces positive dy. Controller stick look down is usually positive Y.
+    # Therefore we do NOT negate mouse[:, 1]. (If mouse moves up, dy is negative, RS looks up).
     out[:, K + 2] = np.clip(mouse[:, 0] / float(mouse_scale), -float(mouse_clip), float(mouse_clip))
-    out[:, K + 3] = np.clip(-mouse[:, 1] / float(mouse_scale), -float(mouse_clip), float(mouse_clip))
+    out[:, K + 3] = np.clip(mouse[:, 1] / float(mouse_scale), -float(mouse_clip), float(mouse_clip))
 
     action_names = button_names + ["lx", "ly", "rx", "ry"]
     return out, button_names, action_names
