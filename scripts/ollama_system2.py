@@ -5,6 +5,7 @@ import numpy as np
 import base64
 from io import BytesIO
 from PIL import Image
+import asyncio
 
 # Use the real helix-db SDK
 try:
@@ -25,46 +26,51 @@ class RealHelixDB:
             self.client = hlx_client.HelixDBClient(db_url)
         else:
             self.client = None
-            self.store = {} # Fallback
+
+        self.store = {} # Fallback / local cache
+
+        # We start a dedicated asyncio loop thread for HelixDB so we don't
+        # create and destroy loops on every request.
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._start_loop, daemon=True)
+        self._thread.start()
+
+    def _start_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _run_async(self, coro):
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=2.0)
 
     def write(self, key, value):
         if self.client:
             try:
-                # Store node in HelixDB.
-                import asyncio
-                # The HelixDB SDK uses specific syntax for creating nodes and edges.
-                # Assuming simple property storage:
+                # The HelixDB SDK uses specific syntax for creating nodes.
                 q = h.write_batch([
                     h.g.add_node("memory", key, {"data": h.stringify_json(value)})
                 ])
-                # Provide a fresh event loop since we are in a sub-thread
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(self.client.run(q))
-                loop.close()
+                self._run_async(self.client.run(q))
             except Exception as e:
                 print(f"[HelixDB] Write Error: {e}")
+                self.store[key] = value # Fallback if write fails
         else:
             self.store[key] = value
 
     def get(self, key, default=None):
         if self.client:
             try:
-                import asyncio
                 q = h.read_batch([
                     h.g.V("memory", key)
                 ])
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                res = loop.run_until_complete(self.client.run(q))
-                loop.close()
+                res = self._run_async(self.client.run(q))
                 if res and res.results and len(res.results) > 0:
                     node = res.results[0]
                     return h.parse_json_structural(node.get("data", default))
-                return default
+                return self.store.get(key, default) # Fallback to local
             except Exception as e:
                 print(f"[HelixDB] Get Error: {e}")
-                return default
+                return self.store.get(key, default)
         else:
             return self.store.get(key, default)
 
@@ -149,8 +155,16 @@ class OllamaSystem2:
             f"Game State:\nHP: {state_copy.get('hp')}\nStatus: {state_copy.get('status')}\n"
             f"Recent Events:\n{events}\n"
             "Output a single concise STRATEGY macro based on the image and text. Examples: 'STRATEGY: KITE_AND_HEAL', 'STRATEGY: AGGRESSIVE_CLOSE_QUARTERS', 'STRATEGY: DODGE'.\n"
-            "Response:"
         )
+
+        # 3. Complete LLM Layer Integration
+        # Actively query HelixDB for context
+        status_key = f"state:{state_copy.get('status')}"
+        memory_context = self.db.get(status_key)
+        if memory_context:
+            prompt += f"\nRelevant Memory from previous encounters:\n{memory_context}\n"
+
+        prompt += "\nResponse:"
 
         try:
             kwargs = {

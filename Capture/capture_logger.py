@@ -512,12 +512,12 @@ def main() -> None:
                 print("[*] Capture PAUSED (Ctrl+P)")
         elif action == "1":
             if input_state.state.get("ctrl", False):
-                recent_events.append("[DODGE_MODE=1]")
-                print("[*] Tagged event: DODGE_MODE")
+                recent_events.append({"frame_id": frame_id, "tag": "[DODGE_MODE=1]"})
+                print(f"[*] Tagged event: DODGE_MODE at frame {frame_id}")
         elif action == "2":
             if input_state.state.get("ctrl", False):
-                recent_events.append("[ATTACK_MODE=1]")
-                print("[*] Tagged event: ATTACK_MODE")
+                recent_events.append({"frame_id": frame_id, "tag": "[ATTACK_MODE=1]"})
+                print(f"[*] Tagged event: ATTACK_MODE at frame {frame_id}")
 
     def on_press(k):
         action = key_to_action(k, allowed_actions)
