@@ -105,7 +105,7 @@ class ModelClient:
                 print(f"Waiting for model server reply... {elapsed_s:.1f}s")
                 next_log_s += 5.0
 
-    def predict(self, image: np.ndarray, game: str = None) -> dict:
+    def predict(self, image: np.ndarray) -> dict:
         """
         Send an image and receive predicted actions.
         
@@ -120,8 +120,7 @@ class ModelClient:
         """
         request = {
             "type": "predict",
-            "image": image,
-            "game": game
+            "image": image
         }
         try:
             response = self._request(request)
