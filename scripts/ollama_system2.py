@@ -182,9 +182,14 @@ class OllamaSystem2:
 
             response = ollama.generate(**kwargs)
             new_strat = response.get("response", "").strip()
-            if "STRATEGY:" in new_strat:
+
+            # Cleanly extract just the strategy portion if Ollama chatters
+            import re
+            match = re.search(r'(STRATEGY:\s*[A-Z_]+)', new_strat)
+            if match:
+                clean_strat = match.group(1).strip()
                 with self._lock:
-                    self.current_strategy = new_strat
+                    self.current_strategy = clean_strat
                 print(f"[Ollama] New strategy: {self.current_strategy}")
 
         except Exception as e:

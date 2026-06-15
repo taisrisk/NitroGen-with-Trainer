@@ -276,6 +276,7 @@ class NitroGenDataset(Dataset):
             )
         self.obs = raw["obs"].numpy() if isinstance(raw["obs"], torch.Tensor) else raw["obs"]
         self.actions = raw["actions"].numpy() if isinstance(raw["actions"], torch.Tensor) else raw["actions"]
+        self.strategies = raw.get("strategies")
         meta = raw.get("meta", {}) if isinstance(raw, dict) else {}
         action_names = meta.get("action_names") if isinstance(meta, dict) else None
         self.action_names: list[str] | None = list(action_names) if isinstance(action_names, (list, tuple)) else None
@@ -464,8 +465,17 @@ class NitroGenDataset(Dataset):
             "dropped_frames": torch.tensor(dropped, dtype=torch.bool),
             "action": torch.from_numpy(action_seq),
         }
-        if self.game is not None:
-            sample["game"] = self.game
+
+        # Determine the target game/strategy string to map for the condition embeddings
+        target_game = self.game
+        if self.strategies is not None and len(self.strategies) > idx:
+            strat = self.strategies[idx]
+            if isinstance(strat, str) and strat.startswith("STRATEGY:") and "IDLE" not in strat:
+                target_game = strat
+
+        if target_game is not None:
+            sample["game"] = target_game
+
         return sample
 
     def _preencode_all(self) -> None:
@@ -778,8 +788,10 @@ def main() -> None:
         )
     image_processor = AutoImageProcessor.from_pretrained(cfg.model_cfg.vision_encoder_name, use_fast=True)
 
+    # If there is a game_mapping but the user provided no fallback --game, we can check if dataset has strategies.
     if tokenizer.game_mapping is not None and args.game is None:
-        raise ValueError("Checkpoint expects a game mapping; provide --game to pick one of the mapped names.")
+        if raw_data.get("strategies") is None:
+            raise ValueError("Checkpoint expects a game mapping; provide --game to pick one of the mapped names.")
 
     dataset = NitroGenDataset(
         path=args.data,
@@ -942,16 +954,29 @@ def main() -> None:
                 stacked: Dict[str, list] = {}
                 t_encode0 = time.time()
                 for b in range(batch_size):
+                    # Pull dynamic game mapping if stored in batch
+                    bg = batch.get("game")
+                    bg_val = bg[b] if bg is not None and isinstance(bg, (list, tuple, np.ndarray)) else args.game
+
                     sample = {
                         "frames": batch["frames"][b].cpu().numpy(),
                         "buttons": batch["buttons"][b].cpu().numpy(),
                         "j_left": batch["j_left"][b].cpu().numpy(),
                         "j_right": batch["j_right"][b].cpu().numpy(),
                         "dropped_frames": batch["dropped_frames"][b].cpu().numpy(),
-                        "game": args.game,
+                        "game": bg_val,
                         "action": batch["action"][b].cpu().numpy(),
                     }
-                    enc = tokenizer.encode(sample)
+
+                    try:
+                        enc = tokenizer.encode(sample)
+                    except AssertionError as e:
+                        if "not found in game mapping" in str(e):
+                            # Default fallback if the dynamic strategy token isn't in mapping
+                            sample["game"] = args.game
+                            enc = tokenizer.encode(sample)
+                        else:
+                            raise
                     for k, v in enc.items():
                         stacked.setdefault(k, []).append(v)
                 encode_time = time.time() - t_encode0

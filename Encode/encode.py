@@ -298,6 +298,12 @@ def build_action_windows(actions: np.ndarray, T: int) -> np.ndarray:
     view = np.lib.stride_tricks.as_strided(actions, shape=(M, T, A), strides=(s0, s0, s1))
     return np.array(view, copy=True)
 
+def build_strategy_windows(strategies: np.ndarray, T: int) -> np.ndarray:
+    # Just take the strategy of the first frame in the chunk as the driving strategy
+    N = strategies.shape[0]
+    M = N - T + 1
+    return np.array(strategies[:M], copy=True)
+
 
 def map_actions_keyboard_space(
     btns: np.ndarray,
@@ -438,6 +444,23 @@ def main() -> None:
     action_dim = int(actions_mapped.shape[1])
     log(f"Mapped actions to keyboard action space ({action_dim}D) -> {actions_mapped.shape}")
     mapping_mode = "keyboard"
+
+    # Map recent_events to frame-level strategies
+    strategies = np.array(["STRATEGY: IDLE"] * actions_mapped.shape[0], dtype=object)
+    recent_events = meta.get("recent_events", [])
+    if recent_events:
+        for event in recent_events:
+            fid = event.get("frame_id")
+            tag = event.get("tag")
+            if fid is not None and tag is not None and fid < len(strategies):
+                # Tag propagates forward for 30 frames (approx 1 second at 30fps) as a simple mechanism
+                end_fid = min(len(strategies), fid + 30)
+                if "DODGE" in tag:
+                    strategies[fid:end_fid] = "STRATEGY: DODGE"
+                elif "ATTACK" in tag:
+                    strategies[fid:end_fid] = "STRATEGY: ATTACK_MODE"
+                else:
+                    strategies[fid:end_fid] = tag
 
     T = args.seq_len
     N = actions_mapped.shape[0]
@@ -683,6 +706,7 @@ def main() -> None:
 
     log("Building action windows")
     acts_np = build_action_windows(actions_mapped, T)
+    strat_np = build_strategy_windows(strategies, T)
     log(f"Built action windows -> {acts_np.shape}")
 
     obs = torch.from_numpy(obs_np)  # (M, 3, H, W)
@@ -692,6 +716,7 @@ def main() -> None:
     out_dict: Dict[str, object] = {
         "obs": obs,
         "actions": acts,
+        "strategies": strat_np.tolist(), # Keep strings as list
         "meta": {
             # Preserve the full capture metadata so downstream tools can merge/trace provenance.
             # This includes keybind profiles, chunks, fps, etc.
