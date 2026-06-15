@@ -227,7 +227,10 @@ class NitrogenTokenizer(Tokenizer):
         j_right = (j_right + 1) / 2.
 
         # Concatenate the buttons and joysticks along the last dimension
-        action = np.concatenate([buttons,j_left,j_right],axis=-1, dtype=np.float32)
+        if self.old_layout:
+            action = np.concatenate([j_left, j_right, buttons], axis=-1, dtype=np.float32)
+        else:
+            action = np.concatenate([buttons, j_left, j_right], axis=-1, dtype=np.float32)
 
         # Squeeze the first dimension of each input: this is the number of chunks, which is 1 here
         action = action.squeeze(0)
