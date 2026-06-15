@@ -383,7 +383,7 @@ env.reset()
 env.pause()
 
 # Start System 2 Ollama Integration
-system2 = OllamaSystem2(model_name="llama3.2:1b", interval_s=1.0)
+system2 = OllamaSystem2(model_name="qwen3.5:2b", interval_s=1.0)
 system2.start()
 
 def _pulse_controller_button(button_name: str, pulse_ms: int):
@@ -495,6 +495,9 @@ with VideoRecorder(str(PATH_MP4_DEBUG), fps=60, crf=32, preset="medium") as debu
 
                 obs = preprocess_img(obs)
                 obs.save(PATH_DEBUG / f"{step_count:05d}.png")
+
+                # Send the raw frame to the System 2 Multimodal Model
+                system2.set_image(obs)
 
                 try:
                     # System 2 injection: Get the latest strategy from Ollama thread
